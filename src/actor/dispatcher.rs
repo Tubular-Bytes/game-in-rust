@@ -3,22 +3,24 @@ use std::collections::VecDeque;
 
 use tokio::task::JoinSet;
 
-use crate::actor::model::{Signal, Queue, Task};
+use crate::actor::model::{Signal, Queue, Task, TaskRequest};
 
 pub struct Dispatcher {
-    tx: tokio::sync::broadcast::Sender<Signal>,
+    websocket: tokio::sync::broadcast::Sender<TaskRequest>,
+    actor_sender: tokio::sync::broadcast::Sender<Signal>,
     queue: Queue,
 
     handles: JoinSet<()>,
+    task_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Dispatcher {
-    pub fn new() -> Self {
-        let (tx, _) = tokio::sync::broadcast::channel::<Signal>(100);
+    pub fn new(websocket: tokio::sync::broadcast::Sender<TaskRequest>) -> Self {
+        let (actor_sender, _) = tokio::sync::broadcast::channel::<Signal>(100);
         let queue: Queue = Arc::new(Mutex::new(VecDeque::<Task>::new()));
         let handles = JoinSet::new();
 
-        Self { tx, queue, handles }
+        Self { websocket, actor_sender, queue, handles, task_handle: None }
     }
 
     pub fn queue(&self) -> Queue {
@@ -26,20 +28,26 @@ impl Dispatcher {
     }
 
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<Signal> {
-        self.tx.subscribe()
+        self.actor_sender.subscribe()
     }
 
     pub async fn dispatch(&self, task: Task) {
         self.queue.lock().unwrap().push_back(task);
-        let _ = self.tx.send(Signal::TaskAdded);
+        let _ = self.actor_sender.send(Signal::TaskAdded);
     }
 
     pub async fn stop(&mut self) {
-        let _ = self.tx.send(Signal::Stop);
+        let _ = self.actor_sender.send(Signal::Stop);
+        
+        if let Some(task_handle) = self.task_handle.take() {
+            tracing::info!("Waiting for task handle to finish...");
+            let _ = tokio::join!(task_handle);
+        }
+
         while self.handles.join_next().await.is_some() {}
     }
 
-    pub async fn listen(&mut self, workers: u8) {
+    pub async fn start(&mut self, workers: u8) {
         for _ in 0..workers {
             let mut rx = self.subscribe();
             let queue = self.queue.clone();
@@ -67,5 +75,26 @@ impl Dispatcher {
                 tracing::info!("Worker finished processing signals.");
             });
         }
+
+
+        // // Move only the receiver and sender, not self, into the spawned task
+        let mut websocket_receiver = self.websocket.subscribe();
+
+        self.task_handle = Some(tokio::spawn(async move {
+            loop {
+                let msg = websocket_receiver.recv().await;
+                match msg {
+                    Ok(task_request) => {
+                        tracing::info!("Received task request: {:?}", task_request);
+                    }
+                    Err(e) => {
+                        tracing::error!("Error receiving task request: {}", e);
+                        break;
+                    }
+                }
+            }
+
+            tracing::info!("WebSocket listener stopped.");
+        }));
     }
 }
