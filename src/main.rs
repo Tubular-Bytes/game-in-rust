@@ -4,8 +4,6 @@ use building_game::actor::model::Task;
 
 #[tokio::main]
 async fn main() {
-
-
     let subscriber = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .pretty()
