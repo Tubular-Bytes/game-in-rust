@@ -19,7 +19,6 @@ async fn main() {
 
     dispatcher.start(2).await;
 
-    
     let addr = env::args().nth(1).unwrap_or_else(|| "127.0.0.1:9100".to_string());
 
     let try_socket = tokio::net::TcpListener::bind(&addr).await;
@@ -72,6 +71,7 @@ async fn accept_connection(stream: TcpStream, tx: tokio::sync::broadcast::Sender
                 tx.send(model::TaskRequest {
                     owner: id,
                     item: msg.to_string(),
+                    kind: model::TaskKind::Build, // Default kind, can be modified as needed
                 }).expect("Failed to send task request");
                 write.send(Message::Text("OK".into())).await.expect("Failed to send response");
                 // Here you can handle the message, e.g., dispatch it to an actor

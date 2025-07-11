@@ -62,7 +62,7 @@ impl Dispatcher {
                         Signal::TaskAdded => {
                             tracing::info!("TaskAdded signal received, processing task...");
                             if let Some(task) = queue.lock().unwrap().pop_front() {
-                                tracing::info!("Processing task with ID: {}", task.id);
+                                tracing::info!("Processing {:?} task with ID: {}", task.kind, task.id);
                             }
                         }
                         Signal::Stop => {
@@ -79,6 +79,8 @@ impl Dispatcher {
 
         // // Move only the receiver and sender, not self, into the spawned task
         let mut websocket_receiver = self.websocket.subscribe();
+        let queue = self.queue();
+        let sender = self.actor_sender.clone();
 
         self.task_handle = Some(tokio::spawn(async move {
             loop {
@@ -86,6 +88,12 @@ impl Dispatcher {
                 match msg {
                     Ok(task_request) => {
                         tracing::info!("Received task request: {:?}", task_request);
+                        let task = Task {
+                            id: task_request.owner,
+                            kind: task_request.kind,
+                        };
+                        queue.lock().unwrap().push_back(task);
+                        let _ = sender.send(Signal::TaskAdded);
                     }
                     Err(e) => {
                         tracing::error!("Error receiving task request: {}", e);
