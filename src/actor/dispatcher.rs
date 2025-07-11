@@ -76,7 +76,6 @@ impl Dispatcher {
             });
         }
 
-
         // // Move only the receiver and sender, not self, into the spawned task
         let mut websocket_receiver = self.websocket.subscribe();
         let queue = self.queue();
