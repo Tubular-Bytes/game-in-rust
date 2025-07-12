@@ -21,8 +21,8 @@ pub enum ResponseSignal {
 impl Display for ResponseSignal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ResponseSignal::Success(msg) => write!(f, "Success: {}", msg),
-            ResponseSignal::Error(msg) => write!(f, "Error: {}", msg),
+            ResponseSignal::Success(msg) => write!(f, "Success: {msg}"),
+            ResponseSignal::Error(msg) => write!(f, "Error: {msg}"),
             ResponseSignal::Stop => write!(f, "Stop"),
         }
     }

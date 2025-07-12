@@ -2,6 +2,7 @@ use building_game::{
     actor::{dispatcher, model},
     api::websocket
 };
+use tokio::task::JoinSet;
 use std::env;
 
 #[tokio::main]
@@ -29,21 +30,27 @@ async fn main() {
         }
     };
 
-    let tcp_handler = tokio::spawn(async move {
-        tracing::info!("Listening for TCP connections on {}", addr);
-        
-        while let Ok((stream, _)) = listener.accept().await {
-            tokio::spawn(websocket::accept_connection(stream, dispatcher_tx.clone()));
+    tracing::info!("Listening for TCP connections on {}", addr);
+    
+    let mut handles = JoinSet::new();
+
+    loop {
+        tokio::select! {
+            Ok((stream, _)) = listener.accept() => {
+                tracing::info!("New connection from {}", stream.peer_addr().unwrap());
+                let dispatcher_tx = dispatcher_tx.clone();
+                handles.spawn(websocket::accept_connection(stream, dispatcher_tx));
+            }
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("Received Ctrl+C, stopping dispatcher...");
+                break;
+            }
         }
-    });
-
-
-    tokio::signal::ctrl_c()
-        .await
-        .expect("Failed to listen for Ctrl+C");
+    }
 
     dispatcher.stop().await;
-    let _ = tcp_handler.await;
+    drop(dispatcher_tx);
+    handles.join_all().await;
 
     tracing::info!("All workers have been stopped.");
 }

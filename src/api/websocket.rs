@@ -29,7 +29,7 @@ pub async fn accept_connection(stream: TcpStream, tx: tokio::sync::broadcast::Se
             }
 
             tracing::info!("Sending response to {}: {}", id, response);
-            let _ = write.send(Message::Text(format!("{}", response).into())).await.expect("Failed to send response");
+            write.send(Message::Text(format!("{response}").into())).await.expect("Failed to send response");
         }
     });
 
