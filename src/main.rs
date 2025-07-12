@@ -43,7 +43,7 @@ async fn main() {
         .expect("Failed to listen for Ctrl+C");
 
     dispatcher.stop().await;
-    tcp_handler.abort();
+    let _ = tcp_handler.await;
 
     tracing::info!("All workers have been stopped.");
 }
