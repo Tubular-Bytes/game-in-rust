@@ -8,9 +8,13 @@ pub async fn accept_connection(stream: TcpStream, tx: tokio::sync::broadcast::Se
     let addr = stream.peer_addr().expect("connected streams should have a peer address");
     let id = Uuid::new_v4();
 
-    let ws_stream = tokio_tungstenite::accept_async(stream)
-        .await
-        .expect("Error during WebSocket handshake");
+    let ws_stream = match tokio_tungstenite::accept_async(stream).await {
+        Ok(stream) => stream,
+        Err(e) => {
+            tracing::error!("WebSocket handshake failed for address {}: {}", addr, e);
+            return;
+        }
+    };
     
     tracing::info!("Accepted connection with ID: {}, address: {}", id, addr);
 
