@@ -42,15 +42,52 @@ async fn main() {
                 handles.spawn(websocket::accept_connection(stream, dispatcher_tx));
             }
             _ = tokio::signal::ctrl_c() => {
-                tracing::info!("Received Ctrl+C, stopping dispatcher...");
+                tracing::info!("Received Ctrl+C, initiating graceful shutdown...");
                 break;
             }
         }
     }
 
+    // Stop accepting new connections
+    drop(listener);
+    
+    // Stop the dispatcher gracefully (this will wait for all tasks to complete)
+    tracing::info!("Stopping dispatcher and waiting for all tasks to complete...");
     dispatcher.stop().await;
+    tracing::info!("Dispatcher stopped successfully.");
+    
+    // Close the broadcast channel to signal no more tasks
     drop(dispatcher_tx);
-    handles.join_all().await;
+    tracing::info!("Broadcast channel closed.");
+    
+    // Wait for all WebSocket connections to close (with timeout)
+    tracing::info!("Waiting for all WebSocket connections to close...");
+    
+    // Set a timeout for WebSocket connections to close gracefully
+    let timeout_duration = tokio::time::Duration::from_secs(5);
+    let start_time = tokio::time::Instant::now();
+    
+    // Wait for handles to complete or timeout
+    loop {
+        if handles.is_empty() {
+            tracing::info!("All WebSocket connections closed gracefully.");
+            break;
+        }
+        
+        if start_time.elapsed() > timeout_duration {
+            tracing::warn!("Timeout waiting for WebSocket connections to close. Forcing shutdown.");
+            handles.abort_all();
+            break;
+        }
+        
+        // Try to join the next handle with a short timeout
+        if let Ok(Some(_)) = tokio::time::timeout(
+            tokio::time::Duration::from_millis(100), 
+            handles.join_next()
+        ).await {
+            // A handle completed successfully
+        }
+    }
 
     tracing::info!("All workers have been stopped.");
 }

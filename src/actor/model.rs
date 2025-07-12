@@ -41,8 +41,9 @@ pub struct Task<T = TaskKind> {
     pub kind: T,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum Signal {
     TaskAdded,
     Stop,
+    GracefulStop,
 }
