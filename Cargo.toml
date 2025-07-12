@@ -1,3 +1,5 @@
+cargo-features = ["edition2024"]
+
 [package]
 name = "building-game"
 version = "0.1.0"
@@ -14,3 +16,6 @@ tokio-tungstenite = "0.27.0"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["fmt", "env-filter", "json"] }
 uuid = { version = "1.17.0", features = ["v4"] }
+
+[profile.release]
+strip = "debuginfo"
