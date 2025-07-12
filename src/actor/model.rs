@@ -1,6 +1,5 @@
 use std::{collections::VecDeque, fmt::Display, sync::{Arc, Mutex}};
 
-use tokio_tungstenite::tungstenite::handshake::client::Response;
 use uuid::Uuid;
 
 pub type Queue = Arc<Mutex<VecDeque<Task>>>;
