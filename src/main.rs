@@ -1,9 +1,9 @@
 use building_game::{
     actor::{dispatcher, model},
-    api::websocket
+    api::websocket,
 };
-use tokio::task::JoinSet;
 use std::env;
+use tokio::task::JoinSet;
 
 #[tokio::main]
 async fn main() {
@@ -19,7 +19,9 @@ async fn main() {
 
     dispatcher.start(2).await;
 
-    let addr = env::args().nth(1).unwrap_or_else(|| "127.0.0.1:9100".to_string());
+    let addr = env::args()
+        .nth(1)
+        .unwrap_or_else(|| "127.0.0.1:9100".to_string());
 
     let try_socket = tokio::net::TcpListener::bind(&addr).await;
     let listener = match try_socket {
@@ -31,7 +33,7 @@ async fn main() {
     };
 
     tracing::info!("Listening for TCP connections on {}", addr);
-    
+
     let mut handles = JoinSet::new();
 
     loop {
@@ -50,41 +52,40 @@ async fn main() {
 
     // Stop accepting new connections
     drop(listener);
-    
+
     // Stop the dispatcher gracefully (this will wait for all tasks to complete)
     tracing::info!("Stopping dispatcher and waiting for all tasks to complete...");
     dispatcher.stop().await;
     tracing::info!("Dispatcher stopped successfully.");
-    
+
     // Close the broadcast channel to signal no more tasks
     drop(dispatcher_tx);
     tracing::info!("Broadcast channel closed.");
-    
+
     // Wait for all WebSocket connections to close (with timeout)
     tracing::info!("Waiting for all WebSocket connections to close...");
-    
+
     // Set a timeout for WebSocket connections to close gracefully
     let timeout_duration = tokio::time::Duration::from_secs(5);
     let start_time = tokio::time::Instant::now();
-    
+
     // Wait for handles to complete or timeout
     loop {
         if handles.is_empty() {
             tracing::info!("All WebSocket connections closed gracefully.");
             break;
         }
-        
+
         if start_time.elapsed() > timeout_duration {
             tracing::warn!("Timeout waiting for WebSocket connections to close. Forcing shutdown.");
             handles.abort_all();
             break;
         }
-        
+
         // Try to join the next handle with a short timeout
-        if let Ok(Some(_)) = tokio::time::timeout(
-            tokio::time::Duration::from_millis(100), 
-            handles.join_next()
-        ).await {
+        if let Ok(Some(_)) =
+            tokio::time::timeout(tokio::time::Duration::from_millis(100), handles.join_next()).await
+        {
             // A handle completed successfully
         }
     }

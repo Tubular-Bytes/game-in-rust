@@ -1,4 +1,8 @@
-use std::{collections::VecDeque, fmt::Display, sync::{Arc, Mutex}};
+use std::{
+    collections::VecDeque,
+    fmt::Display,
+    sync::{Arc, Mutex},
+};
 
 use uuid::Uuid;
 

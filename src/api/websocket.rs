@@ -1,11 +1,16 @@
-use tokio::net::TcpStream;
-use uuid::Uuid;
-use futures_util::{SinkExt, StreamExt};
 use crate::actor::model::{self, ResponseSignal};
+use futures_util::{SinkExt, StreamExt};
+use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
+use uuid::Uuid;
 
-pub async fn accept_connection(stream: TcpStream, tx: tokio::sync::broadcast::Sender<model::TaskRequest>) {
-    let addr = stream.peer_addr().expect("connected streams should have a peer address");
+pub async fn accept_connection(
+    stream: TcpStream,
+    tx: tokio::sync::broadcast::Sender<model::TaskRequest>,
+) {
+    let addr = stream
+        .peer_addr()
+        .expect("connected streams should have a peer address");
     let id = Uuid::new_v4();
 
     let ws_stream = match tokio_tungstenite::accept_async(stream).await {
@@ -15,7 +20,7 @@ pub async fn accept_connection(stream: TcpStream, tx: tokio::sync::broadcast::Se
             return;
         }
     };
-    
+
     tracing::info!("Accepted connection with ID: {}, address: {}", id, addr);
 
     let (mut write, mut read) = ws_stream.split();
@@ -29,7 +34,10 @@ pub async fn accept_connection(stream: TcpStream, tx: tokio::sync::broadcast::Se
             }
 
             tracing::info!("Sending response to {}: {}", id, response);
-            write.send(Message::Text(format!("{response}").into())).await.expect("Failed to send response");
+            write
+                .send(Message::Text(format!("{response}").into()))
+                .await
+                .expect("Failed to send response");
         }
     });
 
@@ -47,12 +55,17 @@ pub async fn accept_connection(stream: TcpStream, tx: tokio::sync::broadcast::Se
                     respond_to: response_tx.clone(),
                 }) {
                     tracing::error!("Failed to send task request: {}", e);
-                    response_tx.send(ResponseSignal::Error(e.to_string())).await.expect("Failed to send error response");
+                    response_tx
+                        .send(ResponseSignal::Error(e.to_string()))
+                        .await
+                        .expect("Failed to send error response");
                     break;
                 }
             }
             Err(e) => {
-                response_tx.clone().send(ResponseSignal::Error(e.to_string()))
+                response_tx
+                    .clone()
+                    .send(ResponseSignal::Error(e.to_string()))
                     .await
                     .expect("Failed to send response");
                 tracing::error!("Error reading message from {}: {}", id, e);
@@ -62,6 +75,9 @@ pub async fn accept_connection(stream: TcpStream, tx: tokio::sync::broadcast::Se
     }
 
     tracing::info!("Connection with ID: {} closed", id);
-    response_tx.send(ResponseSignal::Stop).await.expect("Failed to send stop signal");
+    response_tx
+        .send(ResponseSignal::Stop)
+        .await
+        .expect("Failed to send stop signal");
     let _ = response_handler.await;
 }

@@ -1,6 +1,6 @@
-use std::sync::{Arc, Mutex};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use tokio::task::JoinSet;
 
@@ -23,7 +23,14 @@ impl Dispatcher {
         let handles = JoinSet::new();
         let active_tasks = Arc::new(AtomicUsize::new(0));
 
-        Self { websocket, actor_sender, queue, active_tasks, handles, task_handle: None }
+        Self {
+            websocket,
+            actor_sender,
+            queue,
+            active_tasks,
+            handles,
+            task_handle: None,
+        }
     }
 
     pub fn queue(&self) -> Queue {
@@ -41,50 +48,58 @@ impl Dispatcher {
 
     pub async fn stop(&mut self) {
         tracing::info!("Initiating graceful shutdown...");
-        
+
         // First, signal graceful stop to prevent new tasks from being processed
         let _ = self.actor_sender.send(Signal::GracefulStop);
-        
+
         // Wait for all tasks (active and pending) to complete with timeout
         let max_wait_time = tokio::time::Duration::from_secs(10);
         let start_time = tokio::time::Instant::now();
-        
+
         loop {
             let active = self.active_task_count();
             let pending = self.pending_task_count();
-            
+
             if active == 0 && pending == 0 {
                 break;
             }
-            
+
             // Check for timeout
             if start_time.elapsed() > max_wait_time {
-                tracing::warn!("Timeout waiting for tasks to complete. Active: {}, Pending: {}. Forcing shutdown.", active, pending);
+                tracing::warn!(
+                    "Timeout waiting for tasks to complete. Active: {}, Pending: {}. Forcing shutdown.",
+                    active,
+                    pending
+                );
                 break;
             }
-            
-            tracing::info!("Waiting for tasks to complete... Active: {}, Pending: {} (elapsed: {:?})", 
-                active, pending, start_time.elapsed());
-            
+
+            tracing::info!(
+                "Waiting for tasks to complete... Active: {}, Pending: {} (elapsed: {:?})",
+                active,
+                pending,
+                start_time.elapsed()
+            );
+
             // If there are pending tasks but no active tasks, send a TaskAdded signal to wake up workers
             if pending > 0 && active == 0 {
                 let _ = self.actor_sender.send(Signal::TaskAdded);
             }
-            
+
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         }
-        
+
         tracing::info!("All tasks completed (or timed out), stopping workers...");
-        
+
         // Then send stop signal to terminate workers
         let _ = self.actor_sender.send(Signal::Stop);
-        
+
         tracing::debug!("Sent stop signal to workers");
 
         // Stop the WebSocket task handle first
         if let Some(task_handle) = self.task_handle.take() {
             tracing::info!("Waiting for WebSocket task handle to finish...");
-            
+
             // Add timeout for WebSocket task handle
             match tokio::time::timeout(tokio::time::Duration::from_secs(5), task_handle).await {
                 Ok(_) => {
@@ -99,30 +114,30 @@ impl Dispatcher {
         // Wait for worker handles with timeout
         let worker_timeout = tokio::time::Duration::from_secs(5);
         let worker_start = tokio::time::Instant::now();
-        
+
         loop {
             if self.handles.is_empty() {
                 tracing::info!("All worker handles completed");
                 break;
             }
-            
+
             if worker_start.elapsed() > worker_timeout {
                 tracing::warn!("Timeout waiting for workers to stop. Aborting remaining workers.");
                 self.handles.abort_all();
                 break;
             }
-            
+
             // Try to join next handle with a small timeout
             match tokio::time::timeout(
                 tokio::time::Duration::from_millis(100),
-                self.handles.join_next()
-            ).await {
-                Ok(Some(result)) => {
-                    match result {
-                        Ok(_) => tracing::debug!("Worker stopped successfully"),
-                        Err(e) => tracing::warn!("Worker stopped with error: {:?}", e),
-                    }
-                }
+                self.handles.join_next(),
+            )
+            .await
+            {
+                Ok(Some(result)) => match result {
+                    Ok(_) => tracing::debug!("Worker stopped successfully"),
+                    Err(e) => tracing::warn!("Worker stopped with error: {:?}", e),
+                },
                 Ok(None) => {
                     tracing::debug!("No more workers to join");
                     break;
@@ -132,7 +147,7 @@ impl Dispatcher {
                 }
             }
         }
-        
+
         tracing::info!("All tasks completed and workers stopped.");
     }
 
@@ -165,15 +180,15 @@ impl Dispatcher {
                                         let task = {
                                             queue.lock().unwrap().pop_front()
                                         };
-                                        
+
                                         if let Some(task) = task {
                                             // Increment active task counter
                                             active_tasks.fetch_add(1, Ordering::SeqCst);
                                             tracing::info!("Processing {:?} task with ID: {}", task.kind, task.id);
-                                            
+
                                             // Simulate task processing time
                                             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                                            
+
                                             // Decrement active task counter when done
                                             active_tasks.fetch_sub(1, Ordering::SeqCst);
                                             tracing::info!("Completed task with ID: {}", task.id);
@@ -253,10 +268,10 @@ impl Dispatcher {
 
     pub async fn force_stop(&mut self) {
         tracing::warn!("Force stopping dispatcher...");
-        
+
         // Send stop signal immediately
         let _ = self.actor_sender.send(Signal::Stop);
-        
+
         // Abort WebSocket task handle
         if let Some(task_handle) = self.task_handle.take() {
             task_handle.abort();
@@ -265,7 +280,7 @@ impl Dispatcher {
 
         // Abort all worker handles
         self.handles.abort_all();
-        
+
         tracing::warn!("Force stop completed - all tasks and workers terminated immediately.");
     }
 
