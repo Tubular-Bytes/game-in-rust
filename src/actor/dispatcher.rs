@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
+use crate::actor::error::ProcessTaskError;
 use crate::actor::model::{Queue, ResponseSignal, Signal, Task, TaskRequest};
 
 pub struct Dispatcher {
@@ -178,25 +179,8 @@ impl Dispatcher {
                             match signal {
                                 Signal::TaskAdded => {
                                     if !graceful_stop {
-                                        tracing::debug!("TaskAdded signal received, checking for tasks...");
-                                        let task = {
-                                            queue.lock().unwrap().pop_front()
-                                        };
-
-                                        if let Some(task) = task {
-                                            // Increment active task counter
-                                            active_tasks.fetch_add(1, Ordering::SeqCst);
-                                            tracing::debug!("Worker {} started processing {:?} task with ID: {}", worker_id, task.kind, task.id);
-
-                                            // Simulate task processing time
-                                            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-                                            // Decrement active task counter when done
-                                            active_tasks.fetch_sub(1, Ordering::SeqCst);
-                                            tracing::info!("Completed task with ID: {}", task.id);
-
-                                            task.respond_to.send(ResponseSignal::Success(format!("Task {} completed", task.id)))
-                                                .await.map_err(|e| tracing::error!("Failed to send response: {}", e)).ok();
+                                        if let Err(e) = process_next(queue.clone(), active_tasks.clone(), worker_id).await {
+                                            tracing::warn!("Error processing next task: {:?}", e);
                                         }
                                     } else {
                                         tracing::debug!("Graceful stop initiated, ignoring TaskAdded signal");
@@ -297,5 +281,89 @@ impl Dispatcher {
 
     pub fn total_task_count(&self) -> usize {
         self.active_task_count() + self.pending_task_count()
+    }
+}
+
+async fn process_next(
+    queue: Arc<Mutex<VecDeque<Task>>>,
+    active_tasks: Arc<AtomicUsize>,
+    worker_id: Uuid,
+) -> Result<(), ProcessTaskError> {
+    tracing::debug!("TaskAdded signal received, checking for tasks...");
+    let task = { queue.lock().unwrap().pop_front() };
+
+    if let Some(task) = task {
+        // Increment active task counter
+        active_tasks.fetch_add(1, Ordering::SeqCst);
+        tracing::debug!(
+            "Worker {} started processing {:?} task with ID: {}",
+            worker_id,
+            task.kind,
+            task.id
+        );
+
+        // Simulate task processing time
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Decrement active task counter when done
+        active_tasks.fetch_sub(1, Ordering::SeqCst);
+        tracing::info!("Completed task with ID: {}", task.id);
+
+        task.respond_to
+            .send(ResponseSignal::Success(format!(
+                "Task {} completed",
+                task.id
+            )))
+            .await
+            .map_err(|e| tracing::error!("Failed to send response: {}", e))
+            .ok();
+        Ok(())
+    } else {
+        tracing::debug!("No tasks available in queue for worker {}", worker_id);
+        Err(ProcessTaskError {
+            message: "No tasks available in queue".to_string(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::actor::model::{Task, TaskKind};
+
+    #[tokio::test]
+    async fn test_process_next_success() {
+        let queue: Queue = Arc::new(Mutex::new(VecDeque::new()));
+        let active_tasks = Arc::new(AtomicUsize::new(0));
+        let worker_id = Uuid::new_v4();
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let task = Task {
+            id: Uuid::new_v4(),
+            request_id: "test_request".to_string(),
+            kind: TaskKind::Build,
+            respond_to: tx,
+        };
+
+        queue.lock().unwrap().push_back(task);
+
+        let res = process_next(queue.clone(), active_tasks.clone(), worker_id).await;
+
+        assert_eq!(active_tasks.load(Ordering::SeqCst), 0);
+        assert!(res.is_ok());
+        assert!(queue.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_process_next_queue_empty() {
+        let queue: Queue = Arc::new(Mutex::new(VecDeque::new()));
+        let active_tasks = Arc::new(AtomicUsize::new(0));
+        let worker_id = Uuid::new_v4();
+
+        let res = process_next(queue.clone(), active_tasks.clone(), worker_id).await;
+
+        assert_eq!(active_tasks.load(Ordering::SeqCst), 0);
+        assert!(res.is_err());
+        assert!(queue.lock().unwrap().is_empty());
     }
 }
