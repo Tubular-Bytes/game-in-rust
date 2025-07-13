@@ -178,26 +178,7 @@ impl Dispatcher {
                             match signal {
                                 Signal::TaskAdded => {
                                     if !graceful_stop {
-                                        tracing::debug!("TaskAdded signal received, checking for tasks...");
-                                        let task = {
-                                            queue.lock().unwrap().pop_front()
-                                        };
-
-                                        if let Some(task) = task {
-                                            // Increment active task counter
-                                            active_tasks.fetch_add(1, Ordering::SeqCst);
-                                            tracing::debug!("Worker {} started processing {:?} task with ID: {}", worker_id, task.kind, task.id);
-
-                                            // Simulate task processing time
-                                            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-                                            // Decrement active task counter when done
-                                            active_tasks.fetch_sub(1, Ordering::SeqCst);
-                                            tracing::info!("Completed task with ID: {}", task.id);
-
-                                            task.respond_to.send(ResponseSignal::Success(format!("Task {} completed", task.id)))
-                                                .await.map_err(|e| tracing::error!("Failed to send response: {}", e)).ok();
-                                        }
+                                        fetch_task(queue.clone(), active_tasks.clone(), worker_id).await;
                                     } else {
                                         tracing::debug!("Graceful stop initiated, ignoring TaskAdded signal");
                                     }
@@ -297,5 +278,43 @@ impl Dispatcher {
 
     pub fn total_task_count(&self) -> usize {
         self.active_task_count() + self.pending_task_count()
+    }
+}
+
+async fn fetch_task(
+    queue: Arc<Mutex<VecDeque<Task>>>,
+    active_tasks: Arc<AtomicUsize>,
+    worker_id: Uuid,
+) {
+    tracing::debug!("TaskAdded signal received, checking for tasks...");
+    let task = { queue.lock().unwrap().pop_front() };
+
+    if let Some(task) = task {
+        // Increment active task counter
+        active_tasks.fetch_add(1, Ordering::SeqCst);
+        tracing::debug!(
+            "Worker {} started processing {:?} task with ID: {}",
+            worker_id,
+            task.kind,
+            task.id
+        );
+
+        // Simulate task processing time
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Decrement active task counter when done
+        active_tasks.fetch_sub(1, Ordering::SeqCst);
+        tracing::info!("Completed task with ID: {}", task.id);
+
+        task.respond_to
+            .send(ResponseSignal::Success(format!(
+                "Task {} completed",
+                task.id
+            )))
+            .await
+            .map_err(|e| tracing::error!("Failed to send response: {}", e))
+            .ok();
+    } else {
+        tracing::debug!("No tasks available in queue for worker {}", worker_id);
     }
 }
