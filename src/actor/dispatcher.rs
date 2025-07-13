@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
+use crate::actor::error::ProcessTaskError;
 use crate::actor::model::{Queue, ResponseSignal, Signal, Task, TaskRequest};
 
 pub struct Dispatcher {
@@ -178,7 +179,9 @@ impl Dispatcher {
                             match signal {
                                 Signal::TaskAdded => {
                                     if !graceful_stop {
-                                        fetch_task(queue.clone(), active_tasks.clone(), worker_id).await;
+                                        if let Err(e) = process_next(queue.clone(), active_tasks.clone(), worker_id).await {
+                                            tracing::warn!("Error processing next task: {:?}", e);
+                                        }
                                     } else {
                                         tracing::debug!("Graceful stop initiated, ignoring TaskAdded signal");
                                     }
@@ -281,11 +284,11 @@ impl Dispatcher {
     }
 }
 
-async fn fetch_task(
+async fn process_next(
     queue: Arc<Mutex<VecDeque<Task>>>,
     active_tasks: Arc<AtomicUsize>,
     worker_id: Uuid,
-) {
+) -> Result<(), ProcessTaskError> {
     tracing::debug!("TaskAdded signal received, checking for tasks...");
     let task = { queue.lock().unwrap().pop_front() };
 
@@ -314,7 +317,53 @@ async fn fetch_task(
             .await
             .map_err(|e| tracing::error!("Failed to send response: {}", e))
             .ok();
+        Ok(())
     } else {
         tracing::debug!("No tasks available in queue for worker {}", worker_id);
+        Err(ProcessTaskError {
+            message: "No tasks available in queue".to_string(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::actor::model::{Task, TaskKind};
+
+    #[tokio::test]
+    async fn test_process_next_success() {
+        let queue: Queue = Arc::new(Mutex::new(VecDeque::new()));
+        let active_tasks = Arc::new(AtomicUsize::new(0));
+        let worker_id = Uuid::new_v4();
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let task = Task {
+            id: Uuid::new_v4(),
+            request_id: "test_request".to_string(),
+            kind: TaskKind::Build,
+            respond_to: tx,
+        };
+
+        queue.lock().unwrap().push_back(task);
+
+        let res = process_next(queue.clone(), active_tasks.clone(), worker_id).await;
+
+        assert_eq!(active_tasks.load(Ordering::SeqCst), 0);
+        assert!(res.is_ok());
+        assert!(queue.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_process_next_queue_empty() {
+        let queue: Queue = Arc::new(Mutex::new(VecDeque::new()));
+        let active_tasks = Arc::new(AtomicUsize::new(0));
+        let worker_id = Uuid::new_v4();
+
+        let res = process_next(queue.clone(), active_tasks.clone(), worker_id).await;
+
+        assert_eq!(active_tasks.load(Ordering::SeqCst), 0);
+        assert!(res.is_err());
+        assert!(queue.lock().unwrap().is_empty());
     }
 }
