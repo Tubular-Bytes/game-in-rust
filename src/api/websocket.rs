@@ -1,4 +1,5 @@
 use crate::actor;
+use crate::actor::model::InternalMessage;
 use crate::api;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
@@ -7,7 +8,7 @@ use uuid::Uuid;
 
 pub async fn accept_connection(
     stream: TcpStream,
-    tx: tokio::sync::broadcast::Sender<actor::model::TaskRequest>,
+    tx: tokio::sync::broadcast::Sender<actor::model::InternalMessage>,
 ) {
     let addr = stream
         .peer_addr()
@@ -61,13 +62,13 @@ pub async fn accept_connection(
                         continue;
                     }
                 };
-                if let Err(e) = tx.send(actor::model::TaskRequest {
+                if let Err(e) = tx.send(InternalMessage::TaskRequest(actor::model::TaskRequest {
                     owner: id,
                     request_id: mmsg.id.clone(),
                     item: mmsg.params.blueprint.clone(),
                     kind: actor::model::TaskKind::Build, // Default kind, can be modified as needed
                     respond_to: response_tx.clone(),
-                }) {
+                })) {
                     tracing::error!("Failed to send task request: {}", e);
                     response_tx
                         .send(actor::model::ResponseSignal::Error(e.to_string()))

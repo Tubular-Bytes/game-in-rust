@@ -1,5 +1,5 @@
 use building_game::{
-    actor::{dispatcher, model},
+    actor::{dispatcher, model, broker},
     api::websocket,
 };
 use std::env;
@@ -14,8 +14,9 @@ async fn main() {
     tracing::subscriber::set_global_default(subscriber).expect("Failed to set global subscriber");
     tracing::info!("Starting the application...");
 
-    let (dispatcher_tx, _) = tokio::sync::broadcast::channel::<model::TaskRequest>(100);
-    let mut dispatcher = dispatcher::Dispatcher::new(dispatcher_tx.clone());
+    let broker = broker::Broker::new();
+    let broker_tx = broker.sender.clone();
+    let mut dispatcher = dispatcher::Dispatcher::new(broker);
 
     dispatcher.start(2).await;
 
@@ -40,7 +41,7 @@ async fn main() {
         tokio::select! {
             Ok((stream, _)) = listener.accept() => {
                 tracing::info!("New connection from {}", stream.peer_addr().unwrap());
-                let dispatcher_tx = dispatcher_tx.clone();
+                let dispatcher_tx = broker_tx.clone();
                 handles.spawn(websocket::accept_connection(stream, dispatcher_tx));
             }
             _ = tokio::signal::ctrl_c() => {
@@ -59,7 +60,7 @@ async fn main() {
     tracing::info!("Dispatcher stopped successfully.");
 
     // Close the broadcast channel to signal no more tasks
-    drop(dispatcher_tx);
+    drop(broker_tx);
     tracing::info!("Broadcast channel closed.");
 
     // Wait for all WebSocket connections to close (with timeout)

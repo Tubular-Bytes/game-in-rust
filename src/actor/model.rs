@@ -49,7 +49,9 @@ pub struct Task<T = TaskKind> {
 }
 
 #[derive(Clone, Debug)]
-pub enum Signal {
+pub enum InternalMessage {
+    TaskRequest(TaskRequest),
+    TaskResponse(ResponseSignal),
     TaskAdded,
     Stop,
     GracefulStop,
