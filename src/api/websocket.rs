@@ -40,16 +40,16 @@ pub async fn accept_connection(stream: TcpStream, tx: tokio::sync::broadcast::Se
                     continue;
                 }
                 tracing::info!("Received message from {}: {:?}", id, msg);
-                tx.send(model::TaskRequest {
+                if let Err(e) = tx.send(model::TaskRequest {
                     owner: id,
                     item: msg.to_string(),
                     kind: model::TaskKind::Build, // Default kind, can be modified as needed
                     respond_to: response_tx.clone(),
-                }).expect("Failed to send task request");
-
-                response_tx.clone().send(ResponseSignal::Success("Task received".to_string()))
-                    .await
-                    .expect("Failed to send response");
+                }) {
+                    tracing::error!("Failed to send task request: {}", e);
+                    response_tx.send(ResponseSignal::Error(e.to_string())).await.expect("Failed to send error response");
+                    break;
+                }
             }
             Err(e) => {
                 response_tx.clone().send(ResponseSignal::Error(e.to_string()))

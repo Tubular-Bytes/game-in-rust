@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::task::JoinSet;
 
-use crate::actor::model::{Signal, Queue, Task, TaskRequest};
+use crate::actor::model::{Queue, ResponseSignal, Signal, Task, TaskRequest};
 
 pub struct Dispatcher {
     websocket: tokio::sync::broadcast::Sender<TaskRequest>,
@@ -177,6 +177,9 @@ impl Dispatcher {
                                             // Decrement active task counter when done
                                             active_tasks.fetch_sub(1, Ordering::SeqCst);
                                             tracing::info!("Completed task with ID: {}", task.id);
+
+                                            task.respond_to.send(ResponseSignal::Success(format!("Task {} completed", task.id)))
+                                                .await.map_err(|e| tracing::error!("Failed to send response: {}", e)).ok();
                                         }
                                     } else {
                                         tracing::debug!("Graceful stop initiated, ignoring TaskAdded signal");
@@ -230,6 +233,7 @@ impl Dispatcher {
                         let task = Task {
                             id: task_request.owner,
                             kind: task_request.kind,
+                            respond_to: task_request.respond_to.clone(),
                         };
                         {
                             queue.lock().unwrap().push_back(task);

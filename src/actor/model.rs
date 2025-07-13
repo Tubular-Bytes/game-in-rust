@@ -39,6 +39,7 @@ pub struct TaskRequest<T = TaskKind> {
 pub struct Task<T = TaskKind> {
     pub id: Uuid,
     pub kind: T,
+    pub respond_to: tokio::sync::mpsc::Sender<ResponseSignal>,
 }
 
 #[derive(Clone, Debug)]
