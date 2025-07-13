@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::task::JoinSet;
+use uuid::Uuid;
 
 use crate::actor::model::{Queue, ResponseSignal, Signal, Task, TaskRequest};
 
@@ -153,6 +154,7 @@ impl Dispatcher {
 
     pub async fn start(&mut self, workers: u8) {
         for _ in 0..workers {
+            let worker_id = Uuid::new_v4();
             let rx = self.subscribe();
             let queue = self.queue.clone();
             let active_tasks = self.active_tasks.clone();
@@ -184,7 +186,7 @@ impl Dispatcher {
                                         if let Some(task) = task {
                                             // Increment active task counter
                                             active_tasks.fetch_add(1, Ordering::SeqCst);
-                                            tracing::info!("Processing {:?} task with ID: {}", task.kind, task.id);
+                                            tracing::debug!("Worker {} started processing {:?} task with ID: {}", worker_id, task.kind, task.id);
 
                                             // Simulate task processing time
                                             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -247,6 +249,7 @@ impl Dispatcher {
                         tracing::info!("Received task request: {:?}", task_request);
                         let task = Task {
                             id: task_request.owner,
+                            request_id: task_request.request_id,
                             kind: task_request.kind,
                             respond_to: task_request.respond_to.clone(),
                         };

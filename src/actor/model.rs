@@ -35,6 +35,7 @@ impl Display for ResponseSignal {
 #[derive(Clone, Debug)]
 pub struct TaskRequest<T = TaskKind> {
     pub owner: Uuid,
+    pub request_id: String,
     pub item: String,
     pub kind: T,
     pub respond_to: tokio::sync::mpsc::Sender<ResponseSignal>,
@@ -42,6 +43,7 @@ pub struct TaskRequest<T = TaskKind> {
 
 pub struct Task<T = TaskKind> {
     pub id: Uuid,
+    pub request_id: String,
     pub kind: T,
     pub respond_to: tokio::sync::mpsc::Sender<ResponseSignal>,
 }

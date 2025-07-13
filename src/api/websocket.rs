@@ -1,4 +1,5 @@
-use crate::actor::model::{self, ResponseSignal};
+use crate::actor;
+use crate::api;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
@@ -6,7 +7,7 @@ use uuid::Uuid;
 
 pub async fn accept_connection(
     stream: TcpStream,
-    tx: tokio::sync::broadcast::Sender<model::TaskRequest>,
+    tx: tokio::sync::broadcast::Sender<actor::model::TaskRequest>,
 ) {
     let addr = stream
         .peer_addr()
@@ -24,11 +25,12 @@ pub async fn accept_connection(
     tracing::info!("Accepted connection with ID: {}, address: {}", id, addr);
 
     let (mut write, mut read) = ws_stream.split();
-    let (response_tx, mut response_rx) = tokio::sync::mpsc::channel::<ResponseSignal>(100);
+    let (response_tx, mut response_rx) =
+        tokio::sync::mpsc::channel::<actor::model::ResponseSignal>(100);
 
     let response_handler = tokio::spawn(async move {
         while let Some(response) = response_rx.recv().await {
-            if let ResponseSignal::Stop = response {
+            if let actor::model::ResponseSignal::Stop = response {
                 tracing::info!("Stopping response handler for ID: {}", id);
                 break;
             }
@@ -48,15 +50,27 @@ pub async fn accept_connection(
                     continue;
                 }
                 tracing::info!("Received message from {}: {:?}", id, msg);
-                if let Err(e) = tx.send(model::TaskRequest {
+                let mmsg = match serde_json::from_str::<api::model::ApiRequest>(&msg.to_string()) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::error!("Failed to parse message from {}: {}", id, e);
+                        response_tx
+                            .send(actor::model::ResponseSignal::Error(e.to_string()))
+                            .await
+                            .expect("Failed to send error response");
+                        continue;
+                    }
+                };
+                if let Err(e) = tx.send(actor::model::TaskRequest {
                     owner: id,
-                    item: msg.to_string(),
-                    kind: model::TaskKind::Build, // Default kind, can be modified as needed
+                    request_id: mmsg.id.clone(),
+                    item: mmsg.params.blueprint.clone(),
+                    kind: actor::model::TaskKind::Build, // Default kind, can be modified as needed
                     respond_to: response_tx.clone(),
                 }) {
                     tracing::error!("Failed to send task request: {}", e);
                     response_tx
-                        .send(ResponseSignal::Error(e.to_string()))
+                        .send(actor::model::ResponseSignal::Error(e.to_string()))
                         .await
                         .expect("Failed to send error response");
                     break;
@@ -65,7 +79,7 @@ pub async fn accept_connection(
             Err(e) => {
                 response_tx
                     .clone()
-                    .send(ResponseSignal::Error(e.to_string()))
+                    .send(actor::model::ResponseSignal::Error(e.to_string()))
                     .await
                     .expect("Failed to send response");
                 tracing::error!("Error reading message from {}: {}", id, e);
@@ -76,7 +90,7 @@ pub async fn accept_connection(
 
     tracing::info!("Connection with ID: {} closed", id);
     response_tx
-        .send(ResponseSignal::Stop)
+        .send(actor::model::ResponseSignal::Stop)
         .await
         .expect("Failed to send stop signal");
     let _ = response_handler.await;
