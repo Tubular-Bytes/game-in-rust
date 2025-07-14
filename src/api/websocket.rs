@@ -3,7 +3,11 @@ use crate::actor::model::InternalMessage;
 use crate::api;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{
+    Message,
+    handshake::server::{Request, Response},
+};
+
 use uuid::Uuid;
 
 pub async fn accept_connection(
@@ -13,9 +17,25 @@ pub async fn accept_connection(
     let addr = stream
         .peer_addr()
         .expect("connected streams should have a peer address");
-    let id = Uuid::new_v4();
+    let mut id = Uuid::new_v4();
 
-    let ws_stream = match tokio_tungstenite::accept_async(stream).await {
+    let callback = |req: &Request, response: Response| {
+        if let Some(id_header) = req.headers().get("Authorization") {
+            if let Ok(id_str) = id_header.to_str() {
+                if let Ok(parsed_id) = Uuid::parse_str(id_str) {
+                    id = parsed_id;
+                } else {
+                    tracing::warn!("Invalid UUID in Authorization header: {}", id_str);
+                }
+            } else {
+                tracing::warn!("Failed to convert Authorization header to string");
+            }
+        }
+
+        Ok(response)
+    };
+
+    let ws_stream = match tokio_tungstenite::accept_hdr_async(stream, callback).await {
         Ok(stream) => stream,
         Err(e) => {
             tracing::error!("WebSocket handshake failed for address {}: {}", addr, e);
