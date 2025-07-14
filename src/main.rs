@@ -1,5 +1,5 @@
 use building_game::{
-    actor::{dispatcher, model, broker},
+    actor::{broker, dispatcher},
     api::websocket,
 };
 use std::env;

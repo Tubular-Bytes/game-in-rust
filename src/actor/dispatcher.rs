@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::actor::broker::Broker;
 use crate::actor::error::ProcessTaskError;
-use crate::actor::model::{Queue, ResponseSignal, InternalMessage, Task, TaskRequest};
+use crate::actor::model::{InternalMessage, Queue, ResponseSignal, Task};
 
 pub struct Dispatcher {
     broker: Broker,
@@ -230,25 +230,22 @@ impl Dispatcher {
             loop {
                 let msg = websocket_receiver.recv().await;
                 match msg {
-                    Ok(message) => {
-                        match message {
-                            InternalMessage::TaskRequest(task_request) => {
-                                tracing::info!("Received task request: {:?}", task_request);
-                                let task = Task {
-                                    id: task_request.owner,
-                                    request_id: task_request.request_id,
-                                    kind: task_request.kind,
-                                    respond_to: task_request.respond_to.clone(),
-                                };
-                                {
-                                    queue.lock().unwrap().push_back(task);
-                                }
-                                let _ = sender.send(InternalMessage::TaskAdded);
-                            },
-                            _ => tracing::debug!("skipping message: {:?}", message),
+                    Ok(message) => match message {
+                        InternalMessage::TaskRequest(task_request) => {
+                            tracing::info!("Received task request: {:?}", task_request);
+                            let task = Task {
+                                id: task_request.owner,
+                                request_id: task_request.request_id,
+                                kind: task_request.kind,
+                                respond_to: task_request.respond_to.clone(),
+                            };
+                            {
+                                queue.lock().unwrap().push_back(task);
+                            }
+                            let _ = sender.send(InternalMessage::TaskAdded);
                         }
-
-                    }
+                        _ => tracing::debug!("skipping message: {:?}", message),
+                    },
                     Err(e) => {
                         tracing::error!("Error receiving task request: {}", e);
                         break;

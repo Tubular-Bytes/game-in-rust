@@ -11,3 +11,9 @@ impl Broker {
         Broker { sender, receiver }
     }
 }
+
+impl Default for Broker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
