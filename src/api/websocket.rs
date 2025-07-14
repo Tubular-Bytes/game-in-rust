@@ -24,12 +24,16 @@ pub async fn accept_connection(
     };
 
     tracing::info!("Accepted connection with ID: {}, address: {}", id, addr);
+    if let Err(e) = tx.send(InternalMessage::AddInventory(id)) {
+        tracing::error!("Failed to send AddInventory message: {}", e);
+        return;
+    }
 
     let (mut write, mut read) = ws_stream.split();
     let (response_tx, mut response_rx) =
         tokio::sync::mpsc::channel::<actor::model::ResponseSignal>(100);
 
-    let response_handler = tokio::spawn(async move {
+    tokio::spawn(async move {
         while let Some(response) = response_rx.recv().await {
             if let actor::model::ResponseSignal::Stop = response {
                 tracing::info!("Stopping response handler for ID: {}", id);
@@ -94,5 +98,7 @@ pub async fn accept_connection(
         .send(actor::model::ResponseSignal::Stop)
         .await
         .expect("Failed to send stop signal");
-    let _ = response_handler.await;
+    if let Err(e) = tx.send(InternalMessage::RemoveInventory(id)) {
+        tracing::error!("Failed to send RemoveInventory message: {}", e);
+    }
 }

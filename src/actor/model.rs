@@ -52,6 +52,8 @@ pub struct Task<T = TaskKind> {
 pub enum InternalMessage {
     TaskRequest(TaskRequest),
     TaskResponse(ResponseSignal),
+    AddInventory(Uuid),
+    RemoveInventory(Uuid),
     TaskAdded,
     Stop,
     GracefulStop,

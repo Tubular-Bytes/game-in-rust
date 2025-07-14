@@ -1,6 +1,7 @@
+use std::collections::HashMap;
+
 pub struct Building {
     pub name: String,
-    pub blueprint_type: BlueprintType,
     pub description: String,
     pub cost: Option<Cost>,
     pub requirements: Option<HashMap<String, u32>>,

@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -7,12 +7,14 @@ use uuid::Uuid;
 
 use crate::actor::broker::Broker;
 use crate::actor::error::ProcessTaskError;
+use crate::actor::inventory::Inventory;
 use crate::actor::model::{InternalMessage, Queue, ResponseSignal, Task};
 
 pub struct Dispatcher {
     broker: Broker,
     queue: Queue,
     active_tasks: Arc<AtomicUsize>,
+    inventories: HashMap<Uuid, Inventory>,
 
     handles: JoinSet<()>,
     task_handle: Option<tokio::task::JoinHandle<()>>,
@@ -23,11 +25,13 @@ impl Dispatcher {
         let queue: Queue = Arc::new(Mutex::new(VecDeque::<Task>::new()));
         let handles = JoinSet::new();
         let active_tasks = Arc::new(AtomicUsize::new(0));
+        let inventories = HashMap::new();
 
         Self {
             broker,
             queue,
             active_tasks,
+            inventories,
             handles,
             task_handle: None,
         }
@@ -39,6 +43,14 @@ impl Dispatcher {
 
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<InternalMessage> {
         self.broker.sender.subscribe()
+    }
+
+    pub fn inventories(&self) -> &HashMap<Uuid, Inventory> {
+        &self.inventories
+    }
+
+    pub fn add_inventory(&mut self, inventory: Inventory) {
+        self.inventories.insert(inventory.id(), inventory);
     }
 
     pub async fn dispatch(&self, task: Task) {
@@ -225,6 +237,7 @@ impl Dispatcher {
         let mut websocket_receiver = self.broker.sender.subscribe();
         let queue = self.queue();
         let sender = self.broker.sender.clone();
+        let mut inventories = self.inventories.clone();
 
         self.task_handle = Some(tokio::spawn(async move {
             loop {
@@ -243,6 +256,22 @@ impl Dispatcher {
                                 queue.lock().unwrap().push_back(task);
                             }
                             let _ = sender.send(InternalMessage::TaskAdded);
+                        }
+                        InternalMessage::AddInventory(id) => {
+                            tracing::info!("Adding inventory with ID: {}", id);
+                            if let Some(inventory) = inventories.get(&id) {
+                                tracing::info!("Inventory already exists: {:?}", inventory);
+                            } else {
+                                let inventory = Inventory::new(id);
+                                inventories.insert(id, inventory.clone());
+                                tracing::info!("New inventory added: {}", id);
+                            }
+                        }
+                        InternalMessage::RemoveInventory(id) => {
+                            tracing::info!("Removing inventory with ID: {}", id);
+                            if inventories.remove(&id).is_some() {
+                                tracing::info!("Inventory removed: {}", id);
+                            }
                         }
                         _ => tracing::debug!("skipping message: {:?}", message),
                     },
