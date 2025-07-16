@@ -1,5 +1,6 @@
 use crate::actor::model::InternalMessage;
 
+#[derive(Debug)]
 pub struct Broker {
     pub receiver: tokio::sync::broadcast::Receiver<InternalMessage>,
     pub sender: tokio::sync::broadcast::Sender<InternalMessage>,

@@ -1,10 +1,12 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     fmt::Display,
     sync::{Arc, Mutex},
 };
 
 use uuid::Uuid;
+
+use crate::blueprint::model::Value;
 
 pub type Queue = Arc<Mutex<VecDeque<Task>>>;
 
@@ -54,6 +56,10 @@ pub enum InternalMessage {
     TaskResponse(ResponseSignal),
     AddInventory(Uuid),
     RemoveInventory(Uuid),
+    InventoryReserveRequest(HashMap<String, Value<u64>>),
+    InventoryReserveResponse(Result<Uuid, String>),
+    InventoryReleaseRequest(Uuid),
+    InventoryReleaseResponse(Result<Uuid, String>),
     TaskAdded,
     Stop,
     GracefulStop,

@@ -8,6 +8,7 @@ pub struct Building {
     pub production: Option<Production>,
 }
 
+#[derive(Debug, Clone)]
 pub struct Value<T> {
     pub name: String,
     pub value: T,
