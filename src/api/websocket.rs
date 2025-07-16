@@ -53,7 +53,7 @@ pub async fn accept_connection(
     let (response_tx, mut response_rx) =
         tokio::sync::mpsc::channel::<actor::model::ResponseSignal>(100);
 
-    tokio::spawn(async move {
+    let stop_handle = tokio::spawn(async move {
         while let Some(response) = response_rx.recv().await {
             if let actor::model::ResponseSignal::Stop = response {
                 tracing::info!("Stopping response handler for ID: {}", id);
@@ -113,6 +113,7 @@ pub async fn accept_connection(
         }
     }
 
+    stop_handle.abort();
     tracing::info!("Connection with ID: {} closed", id);
     response_tx
         .send(actor::model::ResponseSignal::Stop)
