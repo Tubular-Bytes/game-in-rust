@@ -9,7 +9,7 @@ use std::{
 use uuid::Uuid;
 
 use crate::actor::{
-    error::ProcessTaskError,
+    error::Error,
     model::{InternalMessage, ResponseSignal, Task},
 };
 
@@ -38,7 +38,20 @@ pub async fn spawn_worker(
                             if let Err(e) =
                                 process_next(queue.clone(), active_tasks.clone(), worker_id).await
                             {
-                                tracing::warn!("Error processing next task: {:?}", e);
+                                match e {
+                                    Error::QueueEmptyError => {
+                                        tracing::debug!(
+                                            "No tasks available in queue for worker {}",
+                                            worker_id
+                                        );
+                                    }
+                                    Error::ProcessError { message } => {
+                                        tracing::error!("Error processing task: {}", message);
+                                    }
+                                    Error::InternalError { message } => {
+                                        tracing::error!("Internal error: {}", message);
+                                    }
+                                }
                             }
                         } else {
                             tracing::debug!("Graceful stop initiated, ignoring TaskAdded signal");
@@ -86,7 +99,7 @@ async fn process_next(
     queue: Arc<Mutex<VecDeque<Task>>>,
     active_tasks: Arc<AtomicUsize>,
     worker_id: Uuid,
-) -> Result<(), ProcessTaskError> {
+) -> Result<(), Error> {
     tracing::debug!("TaskAdded signal received, checking for tasks...");
     let task = { queue.lock().unwrap().pop_front() };
 
@@ -105,7 +118,7 @@ async fn process_next(
 
         // Decrement active task counter when done
         active_tasks.fetch_sub(1, Ordering::SeqCst);
-        tracing::info!("Completed task with ID: {}", task.id);
+        tracing::debug!("Completed task with ID: {}", task.id);
 
         task.respond_to
             .send(ResponseSignal::Success(format!(
@@ -118,9 +131,7 @@ async fn process_next(
         Ok(())
     } else {
         tracing::debug!("No tasks available in queue for worker {}", worker_id);
-        Err(ProcessTaskError {
-            message: "No tasks available in queue".to_string(),
-        })
+        Err(Error::QueueEmptyError)
     }
 }
 

@@ -152,10 +152,13 @@ mod tests {
     use super::*;
     use crate::actor::broker::Broker;
 
+    const INVENTORY_TOPIC: &str = "inventory";
+
     #[tokio::test]
     async fn test_reserve_success() {
         let broker = Broker::new();
-        let inventory = Inventory::new(Uuid::new_v4(), broker.sender.clone());
+        let topic = broker.topic(INVENTORY_TOPIC);
+        let inventory = Inventory::new(Uuid::new_v4(), topic.clone().sender.clone());
 
         fn wood() -> String {
             "wood".to_string()
@@ -180,9 +183,9 @@ mod tests {
         )]);
         let reserve_request = InternalMessage::InventoryReserveRequest(request);
 
-        broker.sender.send(reserve_request).unwrap();
+        topic.clone().sender.send(reserve_request).unwrap();
 
-        let mut rec = broker.sender.subscribe();
+        let mut rec = topic.clone().sender.subscribe();
 
         let id;
         let result = rec.recv().await.unwrap();
@@ -207,7 +210,8 @@ mod tests {
     #[tokio::test]
     async fn test_reserve_insufficient_resources() {
         let broker = Broker::new();
-        let inventory = Inventory::new(Uuid::new_v4(), broker.sender.clone());
+        let topic = broker.topic(INVENTORY_TOPIC);
+        let inventory = Inventory::new(Uuid::new_v4(), topic.clone().sender.clone());
 
         fn wood() -> String {
             "wood".to_string()
@@ -232,9 +236,9 @@ mod tests {
         )]);
         let reserve_request = InternalMessage::InventoryReserveRequest(request);
 
-        broker.sender.send(reserve_request).unwrap();
+        topic.clone().sender.send(reserve_request).unwrap();
 
-        let mut rec = broker.sender.subscribe();
+        let mut rec = topic.clone().sender.subscribe();
         if let Ok(InternalMessage::InventoryReserveResponse(result)) = rec.recv().await {
             assert!(
                 result.is_err_and(|res| res == "insufficient resources".to_string()),
@@ -256,12 +260,13 @@ mod tests {
     #[tokio::test]
     async fn test_inventory_listener_stop() {
         let broker = Broker::new();
-        let inventory = Inventory::new(Uuid::new_v4(), broker.sender.clone());
+        let topic = broker.topic(INVENTORY_TOPIC);
+        let inventory = Inventory::new(Uuid::new_v4(), topic.clone().sender.clone());
 
         inventory.listen().await;
 
         let stop_message = InternalMessage::Stop;
-        broker.sender.send(stop_message).unwrap();
+        topic.clone().sender.send(stop_message).unwrap();
 
         // Wait a moment to ensure the listener has stopped
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -276,7 +281,8 @@ mod tests {
     #[tokio::test]
     async fn test_inventory_release() {
         let broker = Broker::new();
-        let inventory = Inventory::new(Uuid::new_v4(), broker.sender.clone());
+        let topic = broker.topic(INVENTORY_TOPIC);
+        let inventory = Inventory::new(Uuid::new_v4(), topic.clone().sender.clone());
 
         fn wood() -> String {
             "wood".to_string()
@@ -313,7 +319,7 @@ mod tests {
         inventory.listen().await;
 
         let release_request = InternalMessage::InventoryReleaseRequest(receipt_id);
-        let tx = broker.sender.clone();
+        let tx = topic.clone().sender.clone();
         let _ = tx.send(release_request);
 
         tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
@@ -330,7 +336,8 @@ mod tests {
     #[tokio::test]
     async fn test_inventory_internal_stop() {
         let broker = Broker::new();
-        let inventory = Inventory::new(Uuid::new_v4(), broker.sender.clone());
+        let topic = broker.topic(INVENTORY_TOPIC);
+        let inventory = Inventory::new(Uuid::new_v4(), topic.clone().sender.clone());
 
         inventory.listen().await;
 
@@ -346,7 +353,7 @@ mod tests {
 
         {
             let status = inventory.status.lock().unwrap();
-            assert_eq!(*status, Status::Listening);
+            assert_eq!(*status, Status::Stopped);
         }
     }
 }

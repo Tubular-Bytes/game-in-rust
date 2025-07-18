@@ -15,8 +15,8 @@ async fn main() {
     tracing::info!("Starting the application...");
 
     let broker = broker::Broker::new();
-    let broker_tx = broker.sender.clone();
     let mut dispatcher = dispatcher::Dispatcher::new(broker);
+    let broker_tx = dispatcher.topic().clone();
 
     dispatcher.start(2).await;
 

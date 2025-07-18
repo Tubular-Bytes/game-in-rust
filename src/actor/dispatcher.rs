@@ -5,10 +5,12 @@ use std::sync::{Arc, Mutex};
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
-use crate::actor::broker::Broker;
+use crate::actor::broker::{Broker, INVENTORY_TOPIC, WEBSOCKET_TOPIC};
 use crate::actor::inventory::Inventory;
 use crate::actor::model::{InternalMessage, Queue, Task};
 use crate::actor::worker::spawn_worker;
+
+const MAX_WAIT_TIME: u64 = 10; // seconds
 
 pub struct Dispatcher {
     broker: Broker,
@@ -42,52 +44,40 @@ impl Dispatcher {
     }
 
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<InternalMessage> {
-        self.broker.sender.subscribe()
+        self.topic().subscribe()
     }
 
-    pub async fn dispatch(&self, task: Task) {
-        self.queue.lock().unwrap().push_back(task);
-        let _ = self.broker.sender.send(InternalMessage::TaskAdded);
+    pub fn topic(&self) -> tokio::sync::broadcast::Sender<InternalMessage> {
+        self.broker.topic(WEBSOCKET_TOPIC).sender.clone()
+    }
+
+    pub fn send(
+        &self,
+        msg: InternalMessage,
+    ) -> Result<usize, tokio::sync::broadcast::error::SendError<InternalMessage>> {
+        self.broker.topic(WEBSOCKET_TOPIC).publish(msg)
     }
 
     pub async fn stop(&mut self) {
         tracing::info!("Initiating graceful shutdown...");
 
         // First, signal graceful stop to prevent new tasks from being processed
-        let _ = self.broker.sender.send(InternalMessage::GracefulStop);
+        let _ = self.send(InternalMessage::GracefulStop);
 
         // Wait for all tasks (active and pending) to complete with timeout
-        let max_wait_time = tokio::time::Duration::from_secs(10);
         let start_time = tokio::time::Instant::now();
 
         loop {
             let active = self.active_task_count();
             let pending = self.pending_task_count();
 
-            if active == 0 && pending == 0 {
+            if !poll_tasks(start_time, active, pending) {
                 break;
             }
-
-            // Check for timeout
-            if start_time.elapsed() > max_wait_time {
-                tracing::warn!(
-                    "Timeout waiting for tasks to complete. Active: {}, Pending: {}. Forcing shutdown.",
-                    active,
-                    pending
-                );
-                break;
-            }
-
-            tracing::info!(
-                "Waiting for tasks to complete... Active: {}, Pending: {} (elapsed: {:?})",
-                active,
-                pending,
-                start_time.elapsed()
-            );
 
             // If there are pending tasks but no active tasks, send a TaskAdded signal to wake up workers
             if pending > 0 && active == 0 {
-                let _ = self.broker.sender.send(InternalMessage::TaskAdded);
+                let _ = self.send(InternalMessage::TaskAdded);
             }
 
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -96,7 +86,7 @@ impl Dispatcher {
         tracing::info!("All tasks completed (or timed out), stopping workers...");
 
         // Then send stop signal to terminate workers
-        let _ = self.broker.sender.send(InternalMessage::Stop);
+        let _ = self.send(InternalMessage::Stop);
 
         tracing::debug!("Sent stop signal to workers");
 
@@ -165,9 +155,10 @@ impl Dispatcher {
         }
 
         // Move only the receiver and sender, not self, into the spawned task
-        let mut websocket_receiver = self.broker.sender.subscribe();
+        let broker = self.broker.clone();
+        let mut websocket_receiver = self.topic().subscribe();
+        let sender = self.topic().clone();
         let queue = self.queue();
-        let sender = self.broker.sender.clone();
         let inventories = self.inventories.clone();
 
         self.task_handle = Some(tokio::spawn(async move {
@@ -193,7 +184,10 @@ impl Dispatcher {
                             if let Some(inventory) = inventories.lock().unwrap().get(&id) {
                                 tracing::info!("Inventory already exists: {:?}", inventory);
                             } else {
-                                let inventory = Inventory::new(id, sender.clone());
+                                let inventory = Inventory::new(
+                                    id,
+                                    broker.topic(INVENTORY_TOPIC).sender.clone(),
+                                );
                                 inventories.lock().unwrap().insert(id, inventory.clone());
                                 tokio::spawn(async move { inventory.listen().await });
                                 tracing::info!("New inventory added and listening: {}", id);
@@ -229,7 +223,7 @@ impl Dispatcher {
         tracing::warn!("Force stopping dispatcher...");
 
         // Send stop signal immediately
-        let _ = self.broker.sender.send(InternalMessage::Stop);
+        let _ = self.send(InternalMessage::Stop);
 
         // Abort WebSocket task handle
         if let Some(task_handle) = self.task_handle.take() {
@@ -254,4 +248,29 @@ impl Dispatcher {
     pub fn total_task_count(&self) -> usize {
         self.active_task_count() + self.pending_task_count()
     }
+}
+
+fn poll_tasks(start_time: tokio::time::Instant, active: usize, pending: usize) -> bool {
+    if active == 0 && pending == 0 {
+        return false;
+    }
+
+    // Check for timeout
+    if start_time.elapsed() > tokio::time::Duration::from_secs(MAX_WAIT_TIME) {
+        tracing::warn!(
+            "Timeout waiting for tasks to complete. Active: {}, Pending: {}. Forcing shutdown.",
+            active,
+            pending
+        );
+        return false;
+    }
+
+    tracing::info!(
+        "Waiting for tasks to complete... Active: {}, Pending: {} (elapsed: {:?})",
+        active,
+        pending,
+        start_time.elapsed()
+    );
+
+    true
 }
