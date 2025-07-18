@@ -6,10 +6,11 @@ use std::{
 
 use uuid::Uuid;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 enum Status {
     Listening,
     Stopped,
+    Stopping,
 }
 
 #[derive(Debug, Clone)]
@@ -42,6 +43,11 @@ impl Inventory {
         self.id
     }
 
+    pub fn stop(&self) {
+        let mut status = self.status.lock().unwrap();
+        *status = Status::Stopping;
+    }
+
     pub async fn listen(&self) {
         tracing::info!("Listening for inventory updates for ID: {}", self.id);
         let mut receiver = self.broker.subscribe();
@@ -57,6 +63,10 @@ impl Inventory {
 
         tokio::spawn(async move {
             loop {
+                if *status.lock().unwrap() == Status::Stopping {
+                    tracing::info!("Stopping inventory listener for ID: {}", id);
+                    break; // Exit the loop if stopping
+                }
                 tokio::select! {
                     msg = receiver.recv() => {
                         match msg {
@@ -314,6 +324,29 @@ mod tests {
 
             assert!(resources.get(&wood()).is_some_and(|v| v.value == 100));
             assert!(!reserved.contains_key(&receipt_id));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_inventory_internal_stop() {
+        let broker = Broker::new();
+        let inventory = Inventory::new(Uuid::new_v4(), broker.sender.clone());
+
+        inventory.listen().await;
+
+        {
+            let status = inventory.status.lock().unwrap();
+            assert_eq!(*status, Status::Listening);
+        }
+
+        inventory.stop();
+
+        // Wait a moment to ensure the listener has stopped
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        {
+            let status = inventory.status.lock().unwrap();
+            assert_eq!(*status, Status::Listening);
         }
     }
 }
