@@ -21,7 +21,7 @@ pub async fn spawn_worker(
     let worker_id = uuid::Uuid::new_v4();
     let mut rx = receiver;
     let mut graceful_stop = false;
-    tracing::info!("Worker started, waiting for signals...");
+    tracing::debug!("Worker started, waiting for signals...");
 
     loop {
         // Add timeout to signal receiving to prevent hanging
@@ -58,11 +58,11 @@ pub async fn spawn_worker(
                         }
                     }
                     InternalMessage::GracefulStop => {
-                        tracing::info!("Worker received graceful stop signal");
+                        tracing::debug!("Worker received graceful stop signal");
                         graceful_stop = true;
                     }
                     InternalMessage::Stop => {
-                        tracing::info!("Worker received stop signal, exiting...");
+                        tracing::debug!("Worker received stop signal, exiting...");
                         break;
                     }
                     _ => {
@@ -83,7 +83,7 @@ pub async fn spawn_worker(
                     // During graceful stop, check if there are still pending tasks
                     let pending = queue.lock().unwrap().len();
                     if pending == 0 {
-                        tracing::info!("No pending tasks, worker exiting during graceful stop");
+                        tracing::debug!("No pending tasks, worker exiting during graceful stop");
                         break;
                     }
                 }
@@ -92,7 +92,7 @@ pub async fn spawn_worker(
         }
     }
 
-    tracing::info!("Worker finished processing signals.");
+    tracing::debug!("Worker finished processing signals.");
 }
 
 async fn process_next(

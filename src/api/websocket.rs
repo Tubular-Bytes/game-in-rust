@@ -43,7 +43,7 @@ pub async fn accept_connection(
         }
     };
 
-    tracing::info!("Accepted connection with ID: {}, address: {}", id, addr);
+    tracing::debug!("Accepted connection with ID: {}, address: {}", id, addr);
     if let Err(e) = tx.send(InternalMessage::AddInventory(id)) {
         tracing::error!("Failed to send AddInventory message: {}", e);
         return;
@@ -56,11 +56,10 @@ pub async fn accept_connection(
     let stop_handle = tokio::spawn(async move {
         while let Some(response) = response_rx.recv().await {
             if let actor::model::ResponseSignal::Stop = response {
-                tracing::info!("Stopping response handler for ID: {}", id);
+                tracing::debug!("Stopping response handler for ID: {}", id);
                 break;
             }
 
-            tracing::info!("Sending response to {}: {}", id, response);
             write
                 .send(Message::Text(format!("{response}").into()))
                 .await
@@ -74,7 +73,6 @@ pub async fn accept_connection(
                 if !msg.is_text() {
                     continue;
                 }
-                tracing::info!("Received message from {}: {:?}", id, msg);
                 let mmsg = match serde_json::from_str::<api::model::ApiRequest>(&msg.to_string()) {
                     Ok(m) => m,
                     Err(e) => {
@@ -114,7 +112,6 @@ pub async fn accept_connection(
     }
 
     stop_handle.abort();
-    tracing::info!("Connection with ID: {} closed", id);
     response_tx
         .send(actor::model::ResponseSignal::Stop)
         .await

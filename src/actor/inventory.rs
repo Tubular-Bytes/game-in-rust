@@ -49,7 +49,7 @@ impl Inventory {
     }
 
     pub async fn listen(&self) {
-        tracing::info!("Listening for inventory updates for ID: {}", self.id);
+        tracing::debug!("Listening for inventory updates for ID: {}", self.id);
         let mut receiver = self.broker.subscribe();
         let sender = self.broker.clone();
         let id = self.id;
@@ -64,7 +64,7 @@ impl Inventory {
         tokio::spawn(async move {
             loop {
                 if *status.lock().unwrap() == Status::Stopping {
-                    tracing::info!("Stopping inventory listener for ID: {}", id);
+                    tracing::debug!("Stopping inventory listener for ID: {}", id);
                     break; // Exit the loop if stopping
                 }
                 tokio::select! {
@@ -141,7 +141,7 @@ impl Inventory {
                 }
             }
 
-            tracing::info!("Inventory listener stopped");
+            tracing::debug!("Inventory listener stopped");
             *status.lock().unwrap() = Status::Stopped;
         });
     }

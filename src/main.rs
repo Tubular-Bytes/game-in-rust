@@ -40,12 +40,12 @@ async fn main() {
     loop {
         tokio::select! {
             Ok((stream, _)) = listener.accept() => {
-                tracing::info!("New connection from {}", stream.peer_addr().unwrap());
+                tracing::debug!("New connection from {}", stream.peer_addr().unwrap());
                 let dispatcher_tx = broker_tx.clone();
                 handles.spawn(websocket::accept_connection(stream, dispatcher_tx));
             }
             _ = tokio::signal::ctrl_c() => {
-                tracing::info!("Received Ctrl+C, initiating graceful shutdown...");
+                tracing::debug!("Received Ctrl+C, initiating graceful shutdown...");
                 break;
             }
         }
@@ -55,16 +55,16 @@ async fn main() {
     drop(listener);
 
     // Stop the dispatcher gracefully (this will wait for all tasks to complete)
-    tracing::info!("Stopping dispatcher and waiting for all tasks to complete...");
+    tracing::debug!("Stopping dispatcher and waiting for all tasks to complete...");
     dispatcher.stop().await;
-    tracing::info!("Dispatcher stopped successfully.");
+    tracing::debug!("Dispatcher stopped successfully.");
 
     // Close the broadcast channel to signal no more tasks
     drop(broker_tx);
-    tracing::info!("Broadcast channel closed.");
+    tracing::debug!("Broadcast channel closed.");
 
     // Wait for all WebSocket connections to close (with timeout)
-    tracing::info!("Waiting for all WebSocket connections to close...");
+    tracing::debug!("Waiting for all WebSocket connections to close...");
 
     // Set a timeout for WebSocket connections to close gracefully
     let timeout_duration = tokio::time::Duration::from_secs(5);
@@ -73,7 +73,7 @@ async fn main() {
     // Wait for handles to complete or timeout
     loop {
         if handles.is_empty() {
-            tracing::info!("All WebSocket connections closed gracefully.");
+            tracing::debug!("All WebSocket connections closed gracefully.");
             break;
         }
 
@@ -91,5 +91,6 @@ async fn main() {
         }
     }
 
-    tracing::info!("All workers have been stopped.");
+    tracing::debug!("All workers have been stopped.");
+    tracing::info!("Shutting down daemon...");
 }

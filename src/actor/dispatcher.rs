@@ -83,7 +83,7 @@ impl Dispatcher {
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         }
 
-        tracing::info!("All tasks completed (or timed out), stopping workers...");
+        tracing::debug!("All tasks completed (or timed out), stopping workers...");
 
         // Then send stop signal to terminate workers
         let _ = self.send(InternalMessage::Stop);
@@ -92,12 +92,12 @@ impl Dispatcher {
 
         // Stop the WebSocket task handle first
         if let Some(task_handle) = self.task_handle.take() {
-            tracing::info!("Waiting for WebSocket task handle to finish...");
+            tracing::debug!("Waiting for WebSocket task handle to finish...");
 
             // Add timeout for WebSocket task handle
             match tokio::time::timeout(tokio::time::Duration::from_secs(5), task_handle).await {
                 Ok(_) => {
-                    tracing::info!("WebSocket task handle finished gracefully");
+                    tracing::debug!("WebSocket task handle finished gracefully");
                 }
                 Err(_) => {
                     tracing::warn!("WebSocket task handle timed out, continuing shutdown");
@@ -111,7 +111,7 @@ impl Dispatcher {
 
         loop {
             if self.handles.is_empty() {
-                tracing::info!("All worker handles completed");
+                tracing::debug!("All worker handles completed");
                 break;
             }
 
@@ -142,7 +142,7 @@ impl Dispatcher {
             }
         }
 
-        tracing::info!("All tasks completed and workers stopped.");
+        tracing::debug!("All tasks completed and workers stopped.");
     }
 
     pub async fn start(&mut self, workers: u8) {
@@ -167,7 +167,7 @@ impl Dispatcher {
                 match msg {
                     Ok(message) => match message {
                         InternalMessage::TaskRequest(task_request) => {
-                            tracing::info!("Received task request: {:?}", task_request);
+                            tracing::debug!("Received task request: {:?}", task_request);
                             let task = Task {
                                 id: task_request.owner,
                                 request_id: task_request.request_id,
@@ -182,7 +182,7 @@ impl Dispatcher {
                         InternalMessage::AddInventory(id) => {
                             tracing::info!("Adding inventory with ID: {}", id);
                             if let Some(inventory) = inventories.lock().unwrap().get(&id) {
-                                tracing::info!("Inventory already exists: {:?}", inventory);
+                                tracing::debug!("Inventory already exists: {:?}", inventory);
                             } else {
                                 let inventory = Inventory::new(
                                     id,
@@ -190,19 +190,19 @@ impl Dispatcher {
                                 );
                                 inventories.lock().unwrap().insert(id, inventory.clone());
                                 tokio::spawn(async move { inventory.listen().await });
-                                tracing::info!("New inventory added and listening: {}", id);
+                                tracing::debug!("New inventory added and listening: {}", id);
                             }
                         }
                         InternalMessage::RemoveInventory(id) => {
-                            tracing::info!("Removing inventory with ID: {}", id);
+                            tracing::debug!("Removing inventory with ID: {}", id);
                             let mut inventories = inventories.lock().unwrap();
                             if inventories.get(&id).is_none() {
                                 tracing::warn!("Inventory with ID {} does not exist", id);
                             } else if let Some(inventory) = inventories.get(&id) {
                                 inventory.stop();
-                                tracing::info!("Inventory stopped: {}", id);
+                                tracing::debug!("Inventory stopped: {}", id);
                                 if inventories.remove(&id).is_some() {
-                                    tracing::info!("Inventory removed: {}", id);
+                                    tracing::debug!("Inventory removed: {}", id);
                                 }
                             }
                         }
@@ -228,7 +228,7 @@ impl Dispatcher {
         // Abort WebSocket task handle
         if let Some(task_handle) = self.task_handle.take() {
             task_handle.abort();
-            tracing::info!("WebSocket task handle aborted");
+            tracing::debug!("WebSocket task handle aborted");
         }
 
         // Abort all worker handles
@@ -265,7 +265,7 @@ fn poll_tasks(start_time: tokio::time::Instant, active: usize, pending: usize) -
         return false;
     }
 
-    tracing::info!(
+    tracing::debug!(
         "Waiting for tasks to complete... Active: {}, Pending: {} (elapsed: {:?})",
         active,
         pending,
