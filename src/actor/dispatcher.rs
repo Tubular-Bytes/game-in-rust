@@ -1,18 +1,22 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
-use crate::actor::broker::Broker;
-use crate::actor::error::ProcessTaskError;
-use crate::actor::model::{InternalMessage, Queue, ResponseSignal, Task};
+use crate::actor::broker::{Broker, INVENTORY_TOPIC, WEBSOCKET_TOPIC};
+use crate::actor::inventory::Inventory;
+use crate::actor::model::{InternalMessage, Queue, Task};
+use crate::actor::worker::spawn_worker;
+
+const MAX_WAIT_TIME: u64 = 10; // seconds
 
 pub struct Dispatcher {
     broker: Broker,
     queue: Queue,
     active_tasks: Arc<AtomicUsize>,
+    inventories: Arc<Mutex<HashMap<Uuid, Inventory>>>,
 
     handles: JoinSet<()>,
     task_handle: Option<tokio::task::JoinHandle<()>>,
@@ -23,11 +27,13 @@ impl Dispatcher {
         let queue: Queue = Arc::new(Mutex::new(VecDeque::<Task>::new()));
         let handles = JoinSet::new();
         let active_tasks = Arc::new(AtomicUsize::new(0));
+        let inventories = Arc::new(Mutex::new(HashMap::new()));
 
         Self {
             broker,
             queue,
             active_tasks,
+            inventories,
             handles,
             task_handle: None,
         }
@@ -38,72 +44,60 @@ impl Dispatcher {
     }
 
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<InternalMessage> {
-        self.broker.sender.subscribe()
+        self.topic().subscribe()
     }
 
-    pub async fn dispatch(&self, task: Task) {
-        self.queue.lock().unwrap().push_back(task);
-        let _ = self.broker.sender.send(InternalMessage::TaskAdded);
+    pub fn topic(&self) -> tokio::sync::broadcast::Sender<InternalMessage> {
+        self.broker.topic(WEBSOCKET_TOPIC).sender.clone()
+    }
+
+    pub fn send(
+        &self,
+        msg: InternalMessage,
+    ) -> Result<usize, tokio::sync::broadcast::error::SendError<InternalMessage>> {
+        self.broker.topic(WEBSOCKET_TOPIC).publish(msg)
     }
 
     pub async fn stop(&mut self) {
         tracing::info!("Initiating graceful shutdown...");
 
         // First, signal graceful stop to prevent new tasks from being processed
-        let _ = self.broker.sender.send(InternalMessage::GracefulStop);
+        let _ = self.send(InternalMessage::GracefulStop);
 
         // Wait for all tasks (active and pending) to complete with timeout
-        let max_wait_time = tokio::time::Duration::from_secs(10);
         let start_time = tokio::time::Instant::now();
 
         loop {
             let active = self.active_task_count();
             let pending = self.pending_task_count();
 
-            if active == 0 && pending == 0 {
+            if !poll_tasks(start_time, active, pending) {
                 break;
             }
-
-            // Check for timeout
-            if start_time.elapsed() > max_wait_time {
-                tracing::warn!(
-                    "Timeout waiting for tasks to complete. Active: {}, Pending: {}. Forcing shutdown.",
-                    active,
-                    pending
-                );
-                break;
-            }
-
-            tracing::info!(
-                "Waiting for tasks to complete... Active: {}, Pending: {} (elapsed: {:?})",
-                active,
-                pending,
-                start_time.elapsed()
-            );
 
             // If there are pending tasks but no active tasks, send a TaskAdded signal to wake up workers
             if pending > 0 && active == 0 {
-                let _ = self.broker.sender.send(InternalMessage::TaskAdded);
+                let _ = self.send(InternalMessage::TaskAdded);
             }
 
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         }
 
-        tracing::info!("All tasks completed (or timed out), stopping workers...");
+        tracing::debug!("All tasks completed (or timed out), stopping workers...");
 
         // Then send stop signal to terminate workers
-        let _ = self.broker.sender.send(InternalMessage::Stop);
+        let _ = self.send(InternalMessage::Stop);
 
         tracing::debug!("Sent stop signal to workers");
 
         // Stop the WebSocket task handle first
         if let Some(task_handle) = self.task_handle.take() {
-            tracing::info!("Waiting for WebSocket task handle to finish...");
+            tracing::debug!("Waiting for WebSocket task handle to finish...");
 
             // Add timeout for WebSocket task handle
             match tokio::time::timeout(tokio::time::Duration::from_secs(5), task_handle).await {
                 Ok(_) => {
-                    tracing::info!("WebSocket task handle finished gracefully");
+                    tracing::debug!("WebSocket task handle finished gracefully");
                 }
                 Err(_) => {
                     tracing::warn!("WebSocket task handle timed out, continuing shutdown");
@@ -117,7 +111,7 @@ impl Dispatcher {
 
         loop {
             if self.handles.is_empty() {
-                tracing::info!("All worker handles completed");
+                tracing::debug!("All worker handles completed");
                 break;
             }
 
@@ -148,83 +142,24 @@ impl Dispatcher {
             }
         }
 
-        tracing::info!("All tasks completed and workers stopped.");
+        tracing::debug!("All tasks completed and workers stopped.");
     }
 
     pub async fn start(&mut self, workers: u8) {
         for _ in 0..workers {
-            let worker_id = Uuid::new_v4();
             let rx = self.subscribe();
             let queue = self.queue.clone();
             let active_tasks = self.active_tasks.clone();
 
-            self.handles.spawn(async move {
-                let mut rx = rx;
-                let mut graceful_stop = false;
-                tracing::info!("Worker started, waiting for signals...");
-
-                loop {
-                    // Add timeout to signal receiving to prevent hanging
-                    let signal_result = tokio::time::timeout(
-                        tokio::time::Duration::from_secs(1),
-                        rx.recv()
-                    ).await;
-
-                    match signal_result {
-                        Ok(Ok(signal)) => {
-                            tracing::debug!("Worker received signal: {:?}", signal);
-
-                            match signal {
-                                InternalMessage::TaskAdded => {
-                                    if !graceful_stop {
-                                        if let Err(e) = process_next(queue.clone(), active_tasks.clone(), worker_id).await {
-                                            tracing::warn!("Error processing next task: {:?}", e);
-                                        }
-                                    } else {
-                                        tracing::debug!("Graceful stop initiated, ignoring TaskAdded signal");
-                                    }
-                                }
-                                InternalMessage::GracefulStop => {
-                                    tracing::info!("Worker received graceful stop signal");
-                                    graceful_stop = true;
-                                }
-                                InternalMessage::Stop => {
-                                    tracing::info!("Worker received stop signal, exiting...");
-                                    break;
-                                },
-                                _ => {
-                                    tracing::debug!("Worker ignoring signal: {:?}", signal);
-                                }
-                            }
-                        }
-                        Ok(Err(e)) => {
-                            tracing::warn!("Worker signal receive error: {:?}", e);
-                            break;
-                        }
-                        Err(_) => {
-                            // Timeout - check if we should continue or exit
-                            if graceful_stop {
-                                tracing::debug!("Worker timeout during graceful stop, checking for remaining tasks...");
-                                // During graceful stop, check if there are still pending tasks
-                                let pending = queue.lock().unwrap().len();
-                                if pending == 0 {
-                                    tracing::info!("No pending tasks, worker exiting during graceful stop");
-                                    break;
-                                }
-                            }
-                            // Continue loop for normal timeout
-                        }
-                    }
-                }
-
-                tracing::info!("Worker finished processing signals.");
-            });
+            self.handles.spawn(spawn_worker(rx, queue, active_tasks));
         }
 
         // Move only the receiver and sender, not self, into the spawned task
-        let mut websocket_receiver = self.broker.sender.subscribe();
+        let broker = self.broker.clone();
+        let mut websocket_receiver = self.topic().subscribe();
+        let sender = self.topic().clone();
         let queue = self.queue();
-        let sender = self.broker.sender.clone();
+        let inventories = self.inventories.clone();
 
         self.task_handle = Some(tokio::spawn(async move {
             loop {
@@ -232,7 +167,7 @@ impl Dispatcher {
                 match msg {
                     Ok(message) => match message {
                         InternalMessage::TaskRequest(task_request) => {
-                            tracing::info!("Received task request: {:?}", task_request);
+                            tracing::debug!("Received task request: {:?}", task_request);
                             let task = Task {
                                 id: task_request.owner,
                                 request_id: task_request.request_id,
@@ -243,6 +178,33 @@ impl Dispatcher {
                                 queue.lock().unwrap().push_back(task);
                             }
                             let _ = sender.send(InternalMessage::TaskAdded);
+                        }
+                        InternalMessage::AddInventory(id) => {
+                            tracing::info!("Adding inventory with ID: {}", id);
+                            if let Some(inventory) = inventories.lock().unwrap().get(&id) {
+                                tracing::debug!("Inventory already exists: {:?}", inventory);
+                            } else {
+                                let inventory = Inventory::new(
+                                    id,
+                                    broker.topic(INVENTORY_TOPIC).sender.clone(),
+                                );
+                                inventories.lock().unwrap().insert(id, inventory.clone());
+                                tokio::spawn(async move { inventory.listen().await });
+                                tracing::debug!("New inventory added and listening: {}", id);
+                            }
+                        }
+                        InternalMessage::RemoveInventory(id) => {
+                            tracing::debug!("Removing inventory with ID: {}", id);
+                            let mut inventories = inventories.lock().unwrap();
+                            if inventories.get(&id).is_none() {
+                                tracing::warn!("Inventory with ID {} does not exist", id);
+                            } else if let Some(inventory) = inventories.get(&id) {
+                                inventory.stop();
+                                tracing::debug!("Inventory stopped: {}", id);
+                                if inventories.remove(&id).is_some() {
+                                    tracing::debug!("Inventory removed: {}", id);
+                                }
+                            }
                         }
                         _ => tracing::debug!("skipping message: {:?}", message),
                     },
@@ -261,12 +223,12 @@ impl Dispatcher {
         tracing::warn!("Force stopping dispatcher...");
 
         // Send stop signal immediately
-        let _ = self.broker.sender.send(InternalMessage::Stop);
+        let _ = self.send(InternalMessage::Stop);
 
         // Abort WebSocket task handle
         if let Some(task_handle) = self.task_handle.take() {
             task_handle.abort();
-            tracing::info!("WebSocket task handle aborted");
+            tracing::debug!("WebSocket task handle aborted");
         }
 
         // Abort all worker handles
@@ -288,86 +250,27 @@ impl Dispatcher {
     }
 }
 
-async fn process_next(
-    queue: Arc<Mutex<VecDeque<Task>>>,
-    active_tasks: Arc<AtomicUsize>,
-    worker_id: Uuid,
-) -> Result<(), ProcessTaskError> {
-    tracing::debug!("TaskAdded signal received, checking for tasks...");
-    let task = { queue.lock().unwrap().pop_front() };
+fn poll_tasks(start_time: tokio::time::Instant, active: usize, pending: usize) -> bool {
+    if active == 0 && pending == 0 {
+        return false;
+    }
 
-    if let Some(task) = task {
-        // Increment active task counter
-        active_tasks.fetch_add(1, Ordering::SeqCst);
-        tracing::debug!(
-            "Worker {} started processing {:?} task with ID: {}",
-            worker_id,
-            task.kind,
-            task.id
+    // Check for timeout
+    if start_time.elapsed() > tokio::time::Duration::from_secs(MAX_WAIT_TIME) {
+        tracing::warn!(
+            "Timeout waiting for tasks to complete. Active: {}, Pending: {}. Forcing shutdown.",
+            active,
+            pending
         );
-
-        // Simulate task processing time
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-        // Decrement active task counter when done
-        active_tasks.fetch_sub(1, Ordering::SeqCst);
-        tracing::info!("Completed task with ID: {}", task.id);
-
-        task.respond_to
-            .send(ResponseSignal::Success(format!(
-                "Task {} completed",
-                task.id
-            )))
-            .await
-            .map_err(|e| tracing::error!("Failed to send response: {}", e))
-            .ok();
-        Ok(())
-    } else {
-        tracing::debug!("No tasks available in queue for worker {}", worker_id);
-        Err(ProcessTaskError {
-            message: "No tasks available in queue".to_string(),
-        })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::actor::model::{Task, TaskKind};
-
-    #[tokio::test]
-    async fn test_process_next_success() {
-        let queue: Queue = Arc::new(Mutex::new(VecDeque::new()));
-        let active_tasks = Arc::new(AtomicUsize::new(0));
-        let worker_id = Uuid::new_v4();
-
-        let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let task = Task {
-            id: Uuid::new_v4(),
-            request_id: "test_request".to_string(),
-            kind: TaskKind::Build,
-            respond_to: tx,
-        };
-
-        queue.lock().unwrap().push_back(task);
-
-        let res = process_next(queue.clone(), active_tasks.clone(), worker_id).await;
-
-        assert_eq!(active_tasks.load(Ordering::SeqCst), 0);
-        assert!(res.is_ok());
-        assert!(queue.lock().unwrap().is_empty());
+        return false;
     }
 
-    #[tokio::test]
-    async fn test_process_next_queue_empty() {
-        let queue: Queue = Arc::new(Mutex::new(VecDeque::new()));
-        let active_tasks = Arc::new(AtomicUsize::new(0));
-        let worker_id = Uuid::new_v4();
+    tracing::debug!(
+        "Waiting for tasks to complete... Active: {}, Pending: {} (elapsed: {:?})",
+        active,
+        pending,
+        start_time.elapsed()
+    );
 
-        let res = process_next(queue.clone(), active_tasks.clone(), worker_id).await;
-
-        assert_eq!(active_tasks.load(Ordering::SeqCst), 0);
-        assert!(res.is_err());
-        assert!(queue.lock().unwrap().is_empty());
-    }
+    true
 }

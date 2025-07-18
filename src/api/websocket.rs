@@ -3,7 +3,11 @@ use crate::actor::model::InternalMessage;
 use crate::api;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{
+    Message,
+    handshake::server::{Request, Response},
+};
+
 use uuid::Uuid;
 
 pub async fn accept_connection(
@@ -13,9 +17,25 @@ pub async fn accept_connection(
     let addr = stream
         .peer_addr()
         .expect("connected streams should have a peer address");
-    let id = Uuid::new_v4();
+    let mut id = Uuid::new_v4();
 
-    let ws_stream = match tokio_tungstenite::accept_async(stream).await {
+    let callback = |req: &Request, response: Response| {
+        if let Some(id_header) = req.headers().get("Authorization") {
+            if let Ok(id_str) = id_header.to_str() {
+                if let Ok(parsed_id) = Uuid::parse_str(id_str) {
+                    id = parsed_id;
+                } else {
+                    tracing::warn!("Invalid UUID in Authorization header: {}", id_str);
+                }
+            } else {
+                tracing::warn!("Failed to convert Authorization header to string");
+            }
+        }
+
+        Ok(response)
+    };
+
+    let ws_stream = match tokio_tungstenite::accept_hdr_async(stream, callback).await {
         Ok(stream) => stream,
         Err(e) => {
             tracing::error!("WebSocket handshake failed for address {}: {}", addr, e);
@@ -23,20 +43,23 @@ pub async fn accept_connection(
         }
     };
 
-    tracing::info!("Accepted connection with ID: {}, address: {}", id, addr);
+    tracing::debug!("Accepted connection with ID: {}, address: {}", id, addr);
+    if let Err(e) = tx.send(InternalMessage::AddInventory(id)) {
+        tracing::error!("Failed to send AddInventory message: {}", e);
+        return;
+    }
 
     let (mut write, mut read) = ws_stream.split();
     let (response_tx, mut response_rx) =
         tokio::sync::mpsc::channel::<actor::model::ResponseSignal>(100);
 
-    let response_handler = tokio::spawn(async move {
+    let stop_handle = tokio::spawn(async move {
         while let Some(response) = response_rx.recv().await {
             if let actor::model::ResponseSignal::Stop = response {
-                tracing::info!("Stopping response handler for ID: {}", id);
+                tracing::debug!("Stopping response handler for ID: {}", id);
                 break;
             }
 
-            tracing::info!("Sending response to {}: {}", id, response);
             write
                 .send(Message::Text(format!("{response}").into()))
                 .await
@@ -50,7 +73,6 @@ pub async fn accept_connection(
                 if !msg.is_text() {
                     continue;
                 }
-                tracing::info!("Received message from {}: {:?}", id, msg);
                 let mmsg = match serde_json::from_str::<api::model::ApiRequest>(&msg.to_string()) {
                     Ok(m) => m,
                     Err(e) => {
@@ -89,10 +111,12 @@ pub async fn accept_connection(
         }
     }
 
-    tracing::info!("Connection with ID: {} closed", id);
+    stop_handle.abort();
     response_tx
         .send(actor::model::ResponseSignal::Stop)
         .await
         .expect("Failed to send stop signal");
-    let _ = response_handler.await;
+    if let Err(e) = tx.send(InternalMessage::RemoveInventory(id)) {
+        tracing::error!("Failed to send RemoveInventory message: {}", e);
+    }
 }
