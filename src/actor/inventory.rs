@@ -106,8 +106,8 @@ impl Inventory {
                             }
                             Ok(InternalMessage::InventoryReleaseRequest(id)) => {
                                 tracing::debug!("Received inventory release request: {:?}", id);
-                                let mut reserve_lock = reserved.lock().unwrap();
                                 let mut resource_lock = resources.lock().unwrap();
+                                let mut reserve_lock = reserved.lock().unwrap();
 
                                 match reserve_lock.get(&id) {
                                     Some(receipt) => {
