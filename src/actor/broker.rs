@@ -43,6 +43,7 @@ impl Broker {
         Broker { topics }
     }
 
+    #[tracing::instrument(name = "Broker::topic", skip(self))]
     pub fn topic(&self, name: &str) -> Topic {
         let name = name.to_string();
         self.topics

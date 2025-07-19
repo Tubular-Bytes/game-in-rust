@@ -1,11 +1,12 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering}, Arc, Mutex
     },
 };
 
+use opentelemetry::{global, trace::{FutureExt, Span, TraceContextExt}};
+use opentelemetry::trace::Tracer;
 use uuid::Uuid;
 
 use crate::actor::{
@@ -34,6 +35,22 @@ pub async fn spawn_worker(
 
                 match signal {
                     InternalMessage::TaskAdded => {
+                        let carrier = if let Some(task) = queue.lock().unwrap().front() {
+                            task.carrier.clone()
+                        } else {
+                            None
+                        }.unwrap_or_else(|| {
+                            tracing::debug!("No carrier found for task, using empty carrier");
+                            HashMap::new()
+                        });
+
+                        let parent_context = global::get_text_map_propagator(|propagator| {
+                            propagator.extract(&carrier)
+                        });
+
+                        let mut span = global::tracer("worker")
+                            .start_with_context("poll for task", &parent_context);
+
                         if !graceful_stop {
                             if let Err(e) =
                                 process_next(queue.clone(), active_tasks.clone(), worker_id).await
@@ -54,6 +71,7 @@ pub async fn spawn_worker(
                                 }
                             }
                         } else {
+                            span.add_event("graceful_stop", Vec::new());
                             tracing::debug!("Graceful stop initiated, ignoring TaskAdded signal");
                         }
                     }
@@ -152,6 +170,7 @@ mod tests {
             request_id: "test_request".to_string(),
             kind: TaskKind::Build,
             respond_to: tx,
+            carrier: None,
         };
 
         queue.lock().unwrap().push_back(task);

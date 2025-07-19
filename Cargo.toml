@@ -4,15 +4,22 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1.0.98"
 ctrlc2 = { version = "3.7.0", features = ["async"] }
 futures-util = "0.3.31"
+opentelemetry = { version = "0.30.0", features = ["trace"] }
+opentelemetry-otlp = { version = "0.30.0", features = ["grpc-tonic"] }
+opentelemetry-semantic-conventions = { version = "0.30.0", features = ["semconv_experimental"] }
+opentelemetry_sdk = { version = "0.30.0", features = ["trace", "rt-tokio"] }
 rand = "0.9.1"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 tokio = { version = "1.46.1", features = ["full"] }
 tokio-tungstenite = { version = "0.27.0", features = ["handshake"] }
 tracing = "0.1.41"
-tracing-subscriber = { version = "0.3.19", features = ["fmt", "env-filter", "json"] }
+tracing-subscriber = { version = "0.3.19", features = ["fmt", "env-filter", "json", "registry"] }
+tracing-core = "0.1.33"
+tracing-opentelemetry = "0.31.0"
 uuid = { version = "1.17.0", features = ["v4"] }
 
 [profile.release]

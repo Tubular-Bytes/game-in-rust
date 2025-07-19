@@ -17,6 +17,16 @@ pub enum TaskKind {
     Train,
 }
 
+impl Display for TaskKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TaskKind::Build => write!(f, "Build"),
+            TaskKind::Produce => write!(f, "Produce"),
+            TaskKind::Train => write!(f, "Train"),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum ResponseSignal {
     Success(String),
@@ -48,6 +58,7 @@ pub struct Task<T = TaskKind> {
     pub request_id: String,
     pub kind: T,
     pub respond_to: tokio::sync::mpsc::Sender<ResponseSignal>,
+    pub carrier: Option<HashMap<String, String>>,
 }
 
 #[derive(Clone, Debug)]

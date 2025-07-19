@@ -2,8 +2,13 @@ use building_game::{
     actor::{broker, dispatcher},
     api::websocket,
 };
+use opentelemetry_sdk::{propagation::TraceContextPropagator, Resource};
 use std::env;
 use tokio::task::JoinSet;
+
+use opentelemetry::{global, KeyValue};
+
+const WORKER_COUNT: u8 = 2; // Number of worker threads
 
 #[tokio::main]
 async fn main() {
@@ -11,6 +16,29 @@ async fn main() {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .pretty()
         .finish();
+
+    // Initialize OTLP exporter using HTTP binary protocol
+    let otlp_exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
+        .build()
+        .unwrap();
+
+    let resource = Resource::builder()
+        .with_service_name("building_game")
+        .with_attributes([
+            KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
+        ])
+        .build();
+    // Create a tracer provider with the exporter
+    let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_batch_exporter(otlp_exporter)
+        .with_resource(resource)
+        .build();
+
+    // Set it as the global provider
+    global::set_tracer_provider(tracer_provider);
+    global::set_text_map_propagator(TraceContextPropagator::new());
+
     tracing::subscriber::set_global_default(subscriber).expect("Failed to set global subscriber");
     tracing::info!("Starting the application...");
 
@@ -18,7 +46,7 @@ async fn main() {
     let mut dispatcher = dispatcher::Dispatcher::new(broker);
     let broker_tx = dispatcher.topic().clone();
 
-    dispatcher.start(2).await;
+    dispatcher.start(WORKER_COUNT).await;
 
     let addr = env::args()
         .nth(1)

@@ -2,6 +2,10 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use opentelemetry::baggage::BaggageExt;
+use opentelemetry::propagation::TextMapPropagator;
+use opentelemetry::trace::{TraceContextExt, Tracer};
+use opentelemetry::{KeyValue, global};
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
@@ -9,6 +13,7 @@ use crate::actor::broker::{Broker, INVENTORY_TOPIC, WEBSOCKET_TOPIC};
 use crate::actor::inventory::Inventory;
 use crate::actor::model::{InternalMessage, Queue, Task};
 use crate::actor::worker::spawn_worker;
+use crate::instrumentation;
 
 const MAX_WAIT_TIME: u64 = 10; // seconds
 
@@ -51,6 +56,7 @@ impl Dispatcher {
         self.broker.topic(WEBSOCKET_TOPIC).sender.clone()
     }
 
+    #[tracing::instrument(name = "Dispatcher::send", skip(self))]
     pub fn send(
         &self,
         msg: InternalMessage,
@@ -167,17 +173,29 @@ impl Dispatcher {
                 match msg {
                     Ok(message) => match message {
                         InternalMessage::TaskRequest(task_request) => {
-                            tracing::debug!("Received task request: {:?}", task_request);
-                            let task = Task {
-                                id: task_request.owner,
-                                request_id: task_request.request_id,
-                                kind: task_request.kind,
-                                respond_to: task_request.respond_to.clone(),
-                            };
-                            {
-                                queue.lock().unwrap().push_back(task);
-                            }
-                            let _ = sender.send(InternalMessage::TaskAdded);
+                            let tracer = global::tracer("building-game");
+                            tracer.in_span("handling task request", |ctx| {
+                                let carrier = instrumentation::build_carrier(&ctx.span().span_context());
+                                tracing::debug!("Received task request: {:?}", task_request);
+                                let task = Task {
+                                    id: task_request.owner,
+                                    request_id: task_request.request_id,
+                                    kind: task_request.kind,
+                                    respond_to: task_request.respond_to.clone(),
+                                    carrier: Some(carrier),
+                                };
+                                {
+                                    ctx.span().add_event(
+                                        "push task",
+                                        vec![
+                                            KeyValue::new("task_id", task.id.to_string()),
+                                            KeyValue::new("kind", task.kind.to_string()),
+                                        ],
+                                    );
+                                    queue.lock().unwrap().push_back(task);
+                                }
+                                let _ = sender.send(InternalMessage::TaskAdded);
+                            });
                         }
                         InternalMessage::AddInventory(id) => {
                             tracing::info!("Adding inventory with ID: {}", id);
