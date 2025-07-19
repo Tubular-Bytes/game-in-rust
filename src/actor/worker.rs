@@ -1,17 +1,24 @@
 use std::{
     collections::{HashMap, VecDeque},
     sync::{
-        atomic::{AtomicUsize, Ordering}, Arc, Mutex
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
     },
 };
 
-use opentelemetry::{global, trace::{FutureExt, Span, TraceContextExt}};
 use opentelemetry::trace::Tracer;
+use opentelemetry::{
+    KeyValue, global,
+    trace::{Span, SpanContext},
+};
 use uuid::Uuid;
 
-use crate::actor::{
-    error::Error,
-    model::{InternalMessage, ResponseSignal, Task},
+use crate::{
+    actor::{
+        error::Error,
+        model::{InternalMessage, ResponseSignal, Task},
+    },
+    instrumentation,
 };
 
 pub async fn spawn_worker(
@@ -39,7 +46,8 @@ pub async fn spawn_worker(
                             task.carrier.clone()
                         } else {
                             None
-                        }.unwrap_or_else(|| {
+                        }
+                        .unwrap_or_else(|| {
                             tracing::debug!("No carrier found for task, using empty carrier");
                             HashMap::new()
                         });
@@ -48,12 +56,19 @@ pub async fn spawn_worker(
                             propagator.extract(&carrier)
                         });
 
+                        println!("{parent_context:?}");
+
                         let mut span = global::tracer("worker")
                             .start_with_context("poll for task", &parent_context);
 
                         if !graceful_stop {
-                            if let Err(e) =
-                                process_next(queue.clone(), active_tasks.clone(), worker_id).await
+                            if let Err(e) = process_next(
+                                span.span_context(),
+                                queue.clone(),
+                                active_tasks.clone(),
+                                worker_id,
+                            )
+                            .await
                             {
                                 match e {
                                     Error::QueueEmptyError => {
@@ -114,14 +129,28 @@ pub async fn spawn_worker(
 }
 
 async fn process_next(
+    ctx: &SpanContext,
     queue: Arc<Mutex<VecDeque<Task>>>,
     active_tasks: Arc<AtomicUsize>,
     worker_id: Uuid,
 ) -> Result<(), Error> {
+    let c = global::get_text_map_propagator(|propagator| {
+        propagator.extract(&instrumentation::build_carrier(ctx))
+    });
+
+    let mut span = global::tracer("worker").start_with_context("process_next", &c);
+
     tracing::debug!("TaskAdded signal received, checking for tasks...");
     let task = { queue.lock().unwrap().pop_front() };
 
     if let Some(task) = task {
+        span.add_event(
+            "found task",
+            vec![
+                KeyValue::new("task_id", task.id.to_string()),
+                KeyValue::new("task_kind", task.kind.to_string()),
+            ],
+        );
         // Increment active task counter
         active_tasks.fetch_add(1, Ordering::SeqCst);
         tracing::debug!(
@@ -138,6 +167,13 @@ async fn process_next(
         active_tasks.fetch_sub(1, Ordering::SeqCst);
         tracing::debug!("Completed task with ID: {}", task.id);
 
+        span.add_event(
+            "finished task",
+            vec![
+                KeyValue::new("task_id", task.id.to_string()),
+                KeyValue::new("task_kind", task.kind.to_string()),
+            ],
+        );
         task.respond_to
             .send(ResponseSignal::Success(format!(
                 "Task {} completed",
@@ -148,6 +184,7 @@ async fn process_next(
             .ok();
         Ok(())
     } else {
+        span.add_event("queue empty", vec![]);
         tracing::debug!("No tasks available in queue for worker {}", worker_id);
         Err(Error::QueueEmptyError)
     }
@@ -173,9 +210,12 @@ mod tests {
             carrier: None,
         };
 
+        let ctx = global::tracer("test_tracer").start("test_span");
+        let span_context = ctx.span_context();
+
         queue.lock().unwrap().push_back(task);
 
-        let res = process_next(queue.clone(), active_tasks.clone(), worker_id).await;
+        let res = process_next(span_context, queue.clone(), active_tasks.clone(), worker_id).await;
 
         assert_eq!(active_tasks.load(Ordering::SeqCst), 0);
         assert!(res.is_ok());
@@ -188,7 +228,10 @@ mod tests {
         let active_tasks = Arc::new(AtomicUsize::new(0));
         let worker_id = Uuid::new_v4();
 
-        let res = process_next(queue.clone(), active_tasks.clone(), worker_id).await;
+        let ctx = global::tracer("test_tracer").start("test_span");
+        let span_context = ctx.span_context();
+
+        let res = process_next(span_context, queue.clone(), active_tasks.clone(), worker_id).await;
 
         assert_eq!(active_tasks.load(Ordering::SeqCst), 0);
         assert!(res.is_err());

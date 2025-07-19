@@ -2,8 +2,6 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use opentelemetry::baggage::BaggageExt;
-use opentelemetry::propagation::TextMapPropagator;
 use opentelemetry::trace::{TraceContextExt, Tracer};
 use opentelemetry::{KeyValue, global};
 use tokio::task::JoinSet;
@@ -175,7 +173,9 @@ impl Dispatcher {
                         InternalMessage::TaskRequest(task_request) => {
                             let tracer = global::tracer("building-game");
                             tracer.in_span("handling task request", |ctx| {
-                                let carrier = instrumentation::build_carrier(&ctx.span().span_context());
+                                let carrier =
+                                    instrumentation::build_carrier(ctx.span().span_context());
+                                println!("{carrier:?}");
                                 tracing::debug!("Received task request: {:?}", task_request);
                                 let task = Task {
                                     id: task_request.owner,
