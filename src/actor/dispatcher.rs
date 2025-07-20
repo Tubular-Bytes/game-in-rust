@@ -417,3 +417,94 @@ impl Dispatcher {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_dispatcher_add_inventory() {
+        let broker = Broker::new();
+        let (_tx, rx) = tokio::sync::mpsc::channel::<Message>(100);
+        let dispatcher = Dispatcher::new(broker, rx);
+
+        let id = Uuid::new_v4();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+
+        Dispatcher::handle_add_inventory(
+            id,
+            &dispatcher.broker,
+            &dispatcher.inventories,
+            Some(reply_tx),
+        )
+        .await;
+
+        let response = reply_rx.await.unwrap();
+        assert!(response.is_ok());
+        assert_eq!(
+            response.unwrap(),
+            "Inventory added and listening".to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dispatcher_remove_inventory() {
+        let broker = Broker::new();
+        let (_tx, rx) = tokio::sync::mpsc::channel::<Message>(100);
+        let dispatcher = Dispatcher::new(broker, rx);
+
+        let inventory_id = Uuid::new_v4();
+
+        Dispatcher::handle_add_inventory(
+            inventory_id,
+            &dispatcher.broker,
+            &dispatcher.inventories,
+            None,
+        )
+        .await;
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+
+        Dispatcher::handle_remove_inventory(inventory_id, &dispatcher.inventories, Some(reply_tx))
+            .await;
+
+        let response = reply_rx.await.unwrap();
+
+        assert!(response.is_ok());
+        assert_eq!(
+            response.unwrap(),
+            format!("Inventory {inventory_id} removed")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dispatcher_handle_task_request() {
+        let broker = Broker::new();
+        let (_tx, rx) = tokio::sync::mpsc::channel::<Message>(100);
+        let dispatcher = Dispatcher::new(broker, rx);
+        let (response_tx, _response_rx) = tokio::sync::mpsc::channel(100);
+
+        let task_request = crate::actor::model::TaskRequest {
+            owner: Uuid::new_v4(),
+            request_id: "test_request".to_string(),
+            kind: crate::actor::model::TaskKind::Build,
+            respond_to: response_tx.clone(),
+            item: "test_item".to_string(),
+        };
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+
+        Dispatcher::handle_task_request(
+            dispatcher.topic(),
+            task_request,
+            &dispatcher.queue,
+            Some(reply_tx),
+        )
+        .await;
+
+        let response = reply_rx.await.unwrap();
+        assert!(response.is_ok());
+        assert_eq!(response.unwrap(), "Task request received".to_string());
+        assert_eq!(dispatcher.queue.lock().unwrap().len(), 1);
+    }
+}
