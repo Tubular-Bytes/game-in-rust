@@ -12,6 +12,7 @@ use crate::actor::model::{InternalMessage, Message, Queue, Task, WebsocketMessag
 use crate::actor::worker::spawn_worker;
 
 const MAX_WAIT_TIME: u64 = 10; // seconds
+const CONCURRENT_TASKS: usize = 10; // Maximum concurrent tasks
 
 pub struct Dispatcher {
     broker: Broker,
@@ -172,9 +173,7 @@ impl Dispatcher {
         let queue = self.queue();
         let inventories = self.inventories.clone();
 
-        // Create semaphore to limit concurrent message handling
-        // Adjust the permit count based on your desired concurrency level
-        let message_semaphore = Arc::new(Semaphore::new(10));
+        let message_semaphore = Arc::new(Semaphore::new(CONCURRENT_TASKS));
 
         loop {
             tokio::select! {
