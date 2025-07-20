@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
@@ -171,6 +172,10 @@ impl Dispatcher {
         let queue = self.queue();
         let inventories = self.inventories.clone();
 
+        // Create semaphore to limit concurrent message handling
+        // Adjust the permit count based on your desired concurrency level
+        let message_semaphore = Arc::new(Semaphore::new(10));
+
         loop {
             tokio::select! {
                 message = self.ws_receiver.recv() => {
@@ -180,20 +185,26 @@ impl Dispatcher {
                                 WebsocketMessage::TaskRequest(task_request) => {
                                     let task_tx = task_tx.clone();
                                     let queue = queue.clone();
+                                    let semaphore = message_semaphore.clone();
                                     tokio::spawn(async move {
+                                        let _permit = semaphore.acquire().await.unwrap();
                                         Self::handle_task_request(task_tx, task_request, &queue, message.reply).await;
                                     });
                                 }
                                 WebsocketMessage::AddInventory(id) => {
                                     let broker = broker.clone();
                                     let inventories = inventories.clone();
+                                    let semaphore = message_semaphore.clone();
                                     tokio::spawn(async move {
+                                        let _permit = semaphore.acquire().await.unwrap();
                                         Self::handle_add_inventory(id, &broker, &inventories, message.reply).await;
                                     });
                                 }
                                 WebsocketMessage::RemoveInventory(id) => {
                                     let inventories = inventories.clone();
+                                    let semaphore = message_semaphore.clone();
                                     tokio::spawn(async move {
+                                        let _permit = semaphore.acquire().await.unwrap();
                                         Self::handle_remove_inventory(id, &inventories, message.reply).await;
                                     });
                                 }
@@ -239,7 +250,13 @@ impl Dispatcher {
     }
 
     pub fn pending_task_count(&self) -> usize {
-        self.queue.lock().map(|queue| queue.len()).unwrap_or(0)
+        match self.queue.lock() {
+            Ok(queue) => queue.len(),
+            Err(e) => {
+                tracing::error!("Failed to acquire queue lock: {}", e);
+                0
+            }
+        }
     }
 
     pub fn total_task_count(&self) -> usize {
@@ -505,6 +522,13 @@ mod tests {
         let response = reply_rx.await.unwrap();
         assert!(response.is_ok());
         assert_eq!(response.unwrap(), "Task request received".to_string());
-        assert_eq!(dispatcher.queue.lock().unwrap().len(), 1);
+        assert_eq!(
+            dispatcher
+                .queue
+                .lock()
+                .expect("Failed to acquire queue lock in test_dispatcher_handle_task_request")
+                .len(),
+            1
+        );
     }
 }

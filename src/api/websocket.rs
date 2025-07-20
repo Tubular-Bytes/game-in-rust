@@ -48,7 +48,7 @@ pub async fn accept_connection(
     msg.reply = Some(inv_tx);
 
     if let Err(e) = tx.send(msg).await {
-        tracing::error!("Failed to send AddInventory message: {}", e);
+        tracing::error!("Failed to send AddInventory message to dispatcher: {}", e);
         return;
     }
     let response = inv_rx
@@ -110,7 +110,7 @@ pub async fn accept_connection(
                 ));
                 msg.reply = Some(task_tx);
                 if let Err(e) = tx.send(msg).await {
-                    tracing::error!("Failed to send task request: {}", e);
+                    tracing::error!("Failed to send TaskRequest message to dispatcher: {}", e);
                     response_tx
                         .send(actor::model::ResponseSignal::Error(e.to_string()))
                         .await
@@ -157,7 +157,10 @@ pub async fn accept_connection(
     let mut msg = actor::model::Message::from(WebsocketMessage::RemoveInventory(id));
     msg.reply = Some(remove_tx);
     if let Err(e) = tx.send(msg).await {
-        tracing::error!("Failed to send RemoveInventory message: {}", e);
+        tracing::error!(
+            "Failed to send RemoveInventory message to dispatcher: {}",
+            e
+        );
     }
 
     let response = remove_rx
