@@ -52,10 +52,7 @@ pub struct Task<T = TaskKind> {
 
 #[derive(Clone, Debug)]
 pub enum InternalMessage {
-    TaskRequest(TaskRequest),
     TaskResponse(ResponseSignal),
-    AddInventory(Uuid),
-    RemoveInventory(Uuid),
     InventoryReserveRequest(HashMap<String, Value<u64>>),
     InventoryReserveResponse(Result<Uuid, String>),
     InventoryReleaseRequest(Uuid),
@@ -63,4 +60,26 @@ pub enum InternalMessage {
     TaskAdded,
     Stop,
     GracefulStop,
+}
+
+pub enum WebsocketMessage {
+    TaskRequest(TaskRequest),
+    AddInventory(Uuid),
+    RemoveInventory(Uuid),
+}
+
+pub struct Message<T = WebsocketMessage> {
+    pub id: Uuid,
+    pub content: T,
+    pub reply: Option<tokio::sync::oneshot::Sender<Result<String, String>>>,
+}
+
+impl From<WebsocketMessage> for Message {
+    fn from(msg: WebsocketMessage) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            content: msg,
+            reply: None,
+        }
+    }
 }
