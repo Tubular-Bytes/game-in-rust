@@ -178,14 +178,24 @@ impl Dispatcher {
                         Some(message) => {
                             match message.content {
                                 WebsocketMessage::TaskRequest(task_request) => {
-                                    Self::handle_task_request(task_tx.clone(), task_request, &queue, message.reply);
+                                    let task_tx = task_tx.clone();
+                                    let queue = queue.clone();
+                                    tokio::spawn(async move {
+                                        Self::handle_task_request(task_tx, task_request, &queue, message.reply).await;
+                                    });
                                 }
-
                                 WebsocketMessage::AddInventory(id) => {
-                                    Self::handle_add_inventory(id, &broker, &inventories, message.reply);
+                                    let broker = broker.clone();
+                                    let inventories = inventories.clone();
+                                    tokio::spawn(async move {
+                                        Self::handle_add_inventory(id, &broker, &inventories, message.reply).await;
+                                    });
                                 }
                                 WebsocketMessage::RemoveInventory(id) => {
-                                    Self::handle_remove_inventory(id, &inventories, message.reply);
+                                    let inventories = inventories.clone();
+                                    tokio::spawn(async move {
+                                        Self::handle_remove_inventory(id, &inventories, message.reply).await;
+                                    });
                                 }
                             }
                         }
@@ -236,7 +246,7 @@ impl Dispatcher {
         self.active_task_count() + self.pending_task_count()
     }
 
-    fn handle_task_request(
+    async fn handle_task_request(
         tx: tokio::sync::broadcast::Sender<InternalMessage>,
         task_request: crate::actor::model::TaskRequest,
         queue: &Queue,
@@ -250,13 +260,11 @@ impl Dispatcher {
             respond_to: task_request.respond_to.clone(),
         };
 
+        // Queue operations are fast, no need for spawn_blocking
         match queue.lock() {
             Ok(mut queue) => {
                 queue.push_back(task);
-
-                tx.send(InternalMessage::TaskAdded)
-                    .expect("Failed to send TaskRequest message");
-
+                let _ = tx.send(InternalMessage::TaskAdded);
                 if let Some(reply_sender) = reply {
                     let _ = reply_sender.send(Ok("Task request received".to_string()));
                 }
@@ -270,7 +278,7 @@ impl Dispatcher {
         }
     }
 
-    fn handle_add_inventory(
+    async fn handle_add_inventory(
         id: Uuid,
         broker: &Broker,
         inventories: &Arc<Mutex<HashMap<Uuid, Inventory>>>,
@@ -278,62 +286,107 @@ impl Dispatcher {
     ) {
         tracing::info!("Adding inventory with ID: {}", id);
 
-        match inventories.lock() {
-            Ok(mut inventories) => {
-                if let Some(inventory) = inventories.get(&id) {
-                    tracing::debug!("Inventory already exists: {:?}", inventory);
-                    if let Some(reply_sender) = reply {
-                        let _ = reply_sender.send(Ok("Inventory already exists".to_string()));
+        let inventories_clone = inventories.clone();
+        let broker_clone = broker.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            match inventories_clone.lock() {
+                Ok(mut inventories) => {
+                    if let std::collections::hash_map::Entry::Vacant(e) = inventories.entry(id) {
+                        let inventory =
+                            Inventory::new(id, broker_clone.topic(INVENTORY_TOPIC).sender.clone());
+                        let inventory_clone = inventory.clone();
+                        e.insert(inventory);
+                        tracing::debug!("New inventory created: {}", id);
+                        Ok((true, Some(inventory_clone))) // needs spawning
+                    } else {
+                        tracing::debug!("Inventory already exists: {}", id);
+                        Ok((false, None)) // (needs_spawn, inventory)
                     }
-                } else {
-                    let inventory =
-                        Inventory::new(id, broker.topic(INVENTORY_TOPIC).sender.clone());
-                    inventories.insert(id, inventory.clone());
-                    tokio::spawn(async move { inventory.listen().await });
-                    tracing::debug!("New inventory added and listening: {}", id);
-                    if let Some(reply_sender) = reply {
-                        let _ = reply_sender.send(Ok("Inventory added and listening".to_string()));
+                }
+                Err(e) => {
+                    tracing::error!("Failed to acquire inventories lock: {}", e);
+                    Err("Internal error: inventories unavailable".to_string())
+                }
+            }
+        })
+        .await;
+
+        // Handle the result and spawn inventory listener if needed
+        match result {
+            Ok(Ok((needs_spawn, inventory_opt))) => {
+                if needs_spawn {
+                    if let Some(inventory) = inventory_opt {
+                        tokio::spawn(async move { inventory.listen().await });
+                        tracing::debug!("New inventory added and listening: {}", id);
+                        if let Some(reply_sender) = reply {
+                            let _ =
+                                reply_sender.send(Ok("Inventory added and listening".to_string()));
+                        }
                     }
+                } else if let Some(reply_sender) = reply {
+                    let _ = reply_sender.send(Ok("Inventory already exists".to_string()));
+                }
+            }
+            Ok(Err(e)) => {
+                if let Some(reply_sender) = reply {
+                    let _ = reply_sender.send(Err(e));
                 }
             }
             Err(e) => {
-                tracing::error!("Failed to acquire inventories lock: {}", e);
+                tracing::error!("Add inventory handler panicked: {}", e);
                 if let Some(reply_sender) = reply {
-                    let _ = reply_sender
-                        .send(Err("Internal error: inventories unavailable".to_string()));
+                    let _ = reply_sender.send(Err("Internal error: handler failed".to_string()));
                 }
             }
         }
     }
 
-    fn handle_remove_inventory(
+    async fn handle_remove_inventory(
         id: Uuid,
         inventories: &Arc<Mutex<HashMap<Uuid, Inventory>>>,
         reply: Option<tokio::sync::oneshot::Sender<Result<String, String>>>,
     ) {
         tracing::debug!("Removing inventory with ID: {}", id);
 
-        match inventories.lock() {
-            Ok(mut inventories) => {
-                // Fix: Check existence and remove in a single atomic operation
-                if let Some(inventory) = inventories.remove(&id) {
-                    inventory.stop();
-                    tracing::debug!("Inventory stopped and removed: {}", id);
-                    if let Some(reply_sender) = reply {
-                        let _ = reply_sender.send(Ok(format!("Inventory {id} removed")));
+        let inventories_clone = inventories.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            match inventories_clone.lock() {
+                Ok(mut inventories) => {
+                    // Check existence and remove in a single atomic operation
+                    if let Some(inventory) = inventories.remove(&id) {
+                        inventory.stop();
+                        tracing::debug!("Inventory stopped and removed: {}", id);
+                        Ok(format!("Inventory {id} removed"))
+                    } else {
+                        tracing::warn!("Inventory with ID {} does not exist", id);
+                        Err(format!("Inventory {id} doesn't exist"))
                     }
-                } else {
-                    tracing::warn!("Inventory with ID {} does not exist", id);
-                    if let Some(reply_sender) = reply {
-                        let _ = reply_sender.send(Err(format!("Inventory {id} doesn't exist")));
-                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to acquire inventories lock: {}", e);
+                    Err("Internal error: inventories unavailable".to_string())
+                }
+            }
+        })
+        .await;
+
+        match result {
+            Ok(Ok(msg)) => {
+                if let Some(reply_sender) = reply {
+                    let _ = reply_sender.send(Ok(msg));
+                }
+            }
+            Ok(Err(e)) => {
+                if let Some(reply_sender) = reply {
+                    let _ = reply_sender.send(Err(e));
                 }
             }
             Err(e) => {
-                tracing::error!("Failed to acquire inventories lock: {}", e);
+                tracing::error!("Remove inventory handler panicked: {}", e);
                 if let Some(reply_sender) = reply {
-                    let _ = reply_sender
-                        .send(Err("Internal error: inventories unavailable".to_string()));
+                    let _ = reply_sender.send(Err("Internal error: handler failed".to_string()));
                 }
             }
         }
