@@ -148,6 +148,15 @@ impl Dispatcher {
     }
 
     pub async fn start(&mut self, workers: u8) {
+        self.start_with_shutdown(workers, tokio::sync::oneshot::channel().1)
+            .await;
+    }
+
+    pub async fn start_with_shutdown(
+        &mut self,
+        workers: u8,
+        mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+    ) {
         for _ in 0..workers {
             let rx = self.subscribe();
             let queue = self.queue.clone();
@@ -162,20 +171,39 @@ impl Dispatcher {
         let queue = self.queue();
         let inventories = self.inventories.clone();
 
-        while let Some(message) = self.ws_receiver.recv().await {
-            match message.content {
-                WebsocketMessage::TaskRequest(task_request) => {
-                    Self::handle_task_request(task_tx.clone(), task_request, &queue, message.reply);
-                }
+        loop {
+            tokio::select! {
+                message = self.ws_receiver.recv() => {
+                    match message {
+                        Some(message) => {
+                            match message.content {
+                                WebsocketMessage::TaskRequest(task_request) => {
+                                    Self::handle_task_request(task_tx.clone(), task_request, &queue, message.reply);
+                                }
 
-                WebsocketMessage::AddInventory(id) => {
-                    Self::handle_add_inventory(id, &broker, &inventories, message.reply);
+                                WebsocketMessage::AddInventory(id) => {
+                                    Self::handle_add_inventory(id, &broker, &inventories, message.reply);
+                                }
+                                WebsocketMessage::RemoveInventory(id) => {
+                                    Self::handle_remove_inventory(id, &inventories, message.reply);
+                                }
+                            }
+                        }
+                        None => {
+                            tracing::debug!("WebSocket receiver channel closed, stopping dispatcher");
+                            break;
+                        }
+                    }
                 }
-                WebsocketMessage::RemoveInventory(id) => {
-                    Self::handle_remove_inventory(id, &inventories, message.reply);
+                _ = &mut shutdown_rx => {
+                    tracing::debug!("Received shutdown signal, stopping dispatcher");
+                    break;
                 }
             }
         }
+
+        // Perform graceful shutdown
+        self.stop().await;
     }
 
     pub async fn force_stop(&mut self) {

@@ -18,8 +18,11 @@ async fn main() {
     let mut dispatcher = dispatcher::Dispatcher::new(broker, ws_rx);
     let broker_tx = dispatcher.topic().clone();
 
-    tokio::spawn(async move {
-        dispatcher.start(2).await;
+    // Create a shutdown signal channel
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+
+    let dispatcher_handle = tokio::spawn(async move {
+        dispatcher.start_with_shutdown(2, shutdown_rx).await;
     });
 
     let addr = env::args()
@@ -55,10 +58,16 @@ async fn main() {
     // Stop accepting new connections
     drop(listener);
 
-    // Stop the dispatcher gracefully (this will wait for all tasks to complete)
-    tracing::debug!("Stopping dispatcher and waiting for all tasks to complete...");
-    // dispatcher.stop().await;
-    // tracing::debug!("Dispatcher stopped successfully.");
+    // Signal the dispatcher to stop gracefully
+    tracing::debug!("Signaling dispatcher to stop...");
+    let _ = shutdown_tx.send(());
+
+    // Wait for the dispatcher to stop
+    tracing::debug!("Waiting for dispatcher to complete shutdown...");
+    match tokio::time::timeout(tokio::time::Duration::from_secs(10), dispatcher_handle).await {
+        Ok(_) => tracing::debug!("Dispatcher stopped successfully."),
+        Err(_) => tracing::warn!("Dispatcher shutdown timed out."),
+    }
 
     // Close the broadcast channel to signal no more tasks
     drop(broker_tx);
