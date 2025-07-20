@@ -9,16 +9,21 @@ use tokio::task::JoinSet;
 async fn main() {
     let subscriber = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .pretty()
         .finish();
     tracing::subscriber::set_global_default(subscriber).expect("Failed to set global subscriber");
     tracing::info!("Starting the application...");
 
     let broker = broker::Broker::new();
-    let mut dispatcher = dispatcher::Dispatcher::new(broker);
+    let (ws_tx, ws_rx) = tokio::sync::mpsc::channel(100);
+    let mut dispatcher = dispatcher::Dispatcher::new(broker, ws_rx);
     let broker_tx = dispatcher.topic().clone();
 
-    dispatcher.start(2).await;
+    // Create a shutdown signal channel
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+
+    let dispatcher_handle = tokio::spawn(async move {
+        dispatcher.start_with_shutdown(2, shutdown_rx).await;
+    });
 
     let addr = env::args()
         .nth(1)
@@ -41,8 +46,7 @@ async fn main() {
         tokio::select! {
             Ok((stream, _)) = listener.accept() => {
                 tracing::debug!("New connection from {}", stream.peer_addr().unwrap());
-                let dispatcher_tx = broker_tx.clone();
-                handles.spawn(websocket::accept_connection(stream, dispatcher_tx));
+                handles.spawn(websocket::accept_connection(stream, ws_tx.clone()));
             }
             _ = tokio::signal::ctrl_c() => {
                 tracing::debug!("Received Ctrl+C, initiating graceful shutdown...");
@@ -54,13 +58,20 @@ async fn main() {
     // Stop accepting new connections
     drop(listener);
 
-    // Stop the dispatcher gracefully (this will wait for all tasks to complete)
-    tracing::debug!("Stopping dispatcher and waiting for all tasks to complete...");
-    dispatcher.stop().await;
-    tracing::debug!("Dispatcher stopped successfully.");
+    // Signal the dispatcher to stop gracefully
+    tracing::debug!("Signaling dispatcher to stop...");
+    let _ = shutdown_tx.send(());
+
+    // Wait for the dispatcher to stop
+    tracing::debug!("Waiting for dispatcher to complete shutdown...");
+    match tokio::time::timeout(tokio::time::Duration::from_secs(10), dispatcher_handle).await {
+        Ok(_) => tracing::debug!("Dispatcher stopped successfully."),
+        Err(_) => tracing::warn!("Dispatcher shutdown timed out."),
+    }
 
     // Close the broadcast channel to signal no more tasks
     drop(broker_tx);
+    drop(ws_tx);
     tracing::debug!("Broadcast channel closed.");
 
     // Wait for all WebSocket connections to close (with timeout)

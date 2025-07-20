@@ -1,5 +1,4 @@
-use crate::actor;
-use crate::actor::model::InternalMessage;
+use crate::actor::{self, model::WebsocketMessage};
 use crate::api;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
@@ -12,7 +11,7 @@ use uuid::Uuid;
 
 pub async fn accept_connection(
     stream: TcpStream,
-    tx: tokio::sync::broadcast::Sender<actor::model::InternalMessage>,
+    tx: tokio::sync::mpsc::Sender<actor::model::Message>,
 ) {
     let addr = stream
         .peer_addr()
@@ -44,9 +43,23 @@ pub async fn accept_connection(
     };
 
     tracing::debug!("Accepted connection with ID: {}, address: {}", id, addr);
-    if let Err(e) = tx.send(InternalMessage::AddInventory(id)) {
-        tracing::error!("Failed to send AddInventory message: {}", e);
+    let (inv_tx, inv_rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
+    let mut msg = actor::model::Message::from(WebsocketMessage::AddInventory(id));
+    msg.reply = Some(inv_tx);
+
+    if let Err(e) = tx.send(msg).await {
+        tracing::error!("Failed to send AddInventory message to dispatcher: {}", e);
         return;
+    }
+    let response = inv_rx
+        .await
+        .unwrap_or_else(|_| Err("Failed to receive response".to_string()));
+
+    if let Err(e) = response {
+        tracing::error!("Failed to add inventory for ID {}: {}", id, e);
+        return;
+    } else {
+        tracing::info!("Inventory added for ID: {}", id);
     }
 
     let (mut write, mut read) = ws_stream.split();
@@ -84,19 +97,42 @@ pub async fn accept_connection(
                         continue;
                     }
                 };
-                if let Err(e) = tx.send(InternalMessage::TaskRequest(actor::model::TaskRequest {
-                    owner: id,
-                    request_id: mmsg.id.clone(),
-                    item: mmsg.params.blueprint.clone(),
-                    kind: actor::model::TaskKind::Build, // Default kind, can be modified as needed
-                    respond_to: response_tx.clone(),
-                })) {
-                    tracing::error!("Failed to send task request: {}", e);
+
+                let (task_tx, task_rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
+                let mut msg = actor::model::Message::from(WebsocketMessage::TaskRequest(
+                    actor::model::TaskRequest {
+                        owner: id,
+                        request_id: mmsg.id.clone(),
+                        item: mmsg.params.blueprint.clone(),
+                        kind: actor::model::TaskKind::Build, // Default kind, can be modified as needed
+                        respond_to: response_tx.clone(),
+                    },
+                ));
+                msg.reply = Some(task_tx);
+                if let Err(e) = tx.send(msg).await {
+                    tracing::error!("Failed to send TaskRequest message to dispatcher: {}", e);
                     response_tx
                         .send(actor::model::ResponseSignal::Error(e.to_string()))
                         .await
                         .expect("Failed to send error response");
                     break;
+                }
+                match task_rx
+                    .await
+                    .unwrap_or_else(|_| Err("Failed to receive response".to_string()))
+                {
+                    Ok(response) => {
+                        response_tx
+                            .send(actor::model::ResponseSignal::Success(response))
+                            .await
+                            .expect("Failed to send success response");
+                    }
+                    Err(e) => {
+                        response_tx
+                            .send(actor::model::ResponseSignal::Error(e))
+                            .await
+                            .expect("Failed to send error response");
+                    }
                 }
             }
             Err(e) => {
@@ -116,7 +152,23 @@ pub async fn accept_connection(
         .send(actor::model::ResponseSignal::Stop)
         .await
         .expect("Failed to send stop signal");
-    if let Err(e) = tx.send(InternalMessage::RemoveInventory(id)) {
-        tracing::error!("Failed to send RemoveInventory message: {}", e);
+
+    let (remove_tx, remove_rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
+    let mut msg = actor::model::Message::from(WebsocketMessage::RemoveInventory(id));
+    msg.reply = Some(remove_tx);
+    if let Err(e) = tx.send(msg).await {
+        tracing::error!(
+            "Failed to send RemoveInventory message to dispatcher: {}",
+            e
+        );
+    }
+
+    let response = remove_rx
+        .await
+        .unwrap_or_else(|_| Err("Failed to receive response".to_string()));
+    if let Err(e) = response {
+        tracing::error!("Failed to remove inventory for ID {}: {}", id, e);
+    } else {
+        tracing::info!("Inventory removed for ID: {}", id);
     }
 }

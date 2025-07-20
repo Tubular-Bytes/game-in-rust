@@ -2,28 +2,31 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
-use crate::actor::broker::{Broker, INVENTORY_TOPIC, WEBSOCKET_TOPIC};
+use crate::actor::broker::{Broker, INVENTORY_TOPIC, TASK_TOPIC};
 use crate::actor::inventory::Inventory;
-use crate::actor::model::{InternalMessage, Queue, Task};
+use crate::actor::model::{InternalMessage, Message, Queue, Task, WebsocketMessage};
 use crate::actor::worker::spawn_worker;
 
 const MAX_WAIT_TIME: u64 = 10; // seconds
+const CONCURRENT_TASKS: usize = 10; // Maximum concurrent tasks
 
 pub struct Dispatcher {
     broker: Broker,
     queue: Queue,
     active_tasks: Arc<AtomicUsize>,
     inventories: Arc<Mutex<HashMap<Uuid, Inventory>>>,
+    ws_receiver: tokio::sync::mpsc::Receiver<Message>,
 
     handles: JoinSet<()>,
     task_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Dispatcher {
-    pub fn new(broker: Broker) -> Self {
+    pub fn new(broker: Broker, ws_receiver: tokio::sync::mpsc::Receiver<Message>) -> Self {
         let queue: Queue = Arc::new(Mutex::new(VecDeque::<Task>::new()));
         let handles = JoinSet::new();
         let active_tasks = Arc::new(AtomicUsize::new(0));
@@ -34,6 +37,7 @@ impl Dispatcher {
             queue,
             active_tasks,
             inventories,
+            ws_receiver,
             handles,
             task_handle: None,
         }
@@ -48,14 +52,14 @@ impl Dispatcher {
     }
 
     pub fn topic(&self) -> tokio::sync::broadcast::Sender<InternalMessage> {
-        self.broker.topic(WEBSOCKET_TOPIC).sender.clone()
+        self.broker.topic(TASK_TOPIC).sender.clone()
     }
 
     pub fn send(
         &self,
         msg: InternalMessage,
     ) -> Result<usize, tokio::sync::broadcast::error::SendError<InternalMessage>> {
-        self.broker.topic(WEBSOCKET_TOPIC).publish(msg)
+        self.broker.topic(TASK_TOPIC).publish(msg)
     }
 
     pub async fn stop(&mut self) {
@@ -71,7 +75,7 @@ impl Dispatcher {
             let active = self.active_task_count();
             let pending = self.pending_task_count();
 
-            if !poll_tasks(start_time, active, pending) {
+            if !Self::poll_tasks(start_time, active, pending) {
                 break;
             }
 
@@ -146,6 +150,15 @@ impl Dispatcher {
     }
 
     pub async fn start(&mut self, workers: u8) {
+        self.start_with_shutdown(workers, tokio::sync::oneshot::channel().1)
+            .await;
+    }
+
+    pub async fn start_with_shutdown(
+        &mut self,
+        workers: u8,
+        mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+    ) {
         for _ in 0..workers {
             let rx = self.subscribe();
             let queue = self.queue.clone();
@@ -156,67 +169,61 @@ impl Dispatcher {
 
         // Move only the receiver and sender, not self, into the spawned task
         let broker = self.broker.clone();
-        let mut websocket_receiver = self.topic().subscribe();
-        let sender = self.topic().clone();
+        let task_tx = self.topic();
         let queue = self.queue();
         let inventories = self.inventories.clone();
 
-        self.task_handle = Some(tokio::spawn(async move {
-            loop {
-                let msg = websocket_receiver.recv().await;
-                match msg {
-                    Ok(message) => match message {
-                        InternalMessage::TaskRequest(task_request) => {
-                            tracing::debug!("Received task request: {:?}", task_request);
-                            let task = Task {
-                                id: task_request.owner,
-                                request_id: task_request.request_id,
-                                kind: task_request.kind,
-                                respond_to: task_request.respond_to.clone(),
-                            };
-                            {
-                                queue.lock().unwrap().push_back(task);
-                            }
-                            let _ = sender.send(InternalMessage::TaskAdded);
-                        }
-                        InternalMessage::AddInventory(id) => {
-                            tracing::info!("Adding inventory with ID: {}", id);
-                            if let Some(inventory) = inventories.lock().unwrap().get(&id) {
-                                tracing::debug!("Inventory already exists: {:?}", inventory);
-                            } else {
-                                let inventory = Inventory::new(
-                                    id,
-                                    broker.topic(INVENTORY_TOPIC).sender.clone(),
-                                );
-                                inventories.lock().unwrap().insert(id, inventory.clone());
-                                tokio::spawn(async move { inventory.listen().await });
-                                tracing::debug!("New inventory added and listening: {}", id);
-                            }
-                        }
-                        InternalMessage::RemoveInventory(id) => {
-                            tracing::debug!("Removing inventory with ID: {}", id);
-                            let mut inventories = inventories.lock().unwrap();
-                            if inventories.get(&id).is_none() {
-                                tracing::warn!("Inventory with ID {} does not exist", id);
-                            } else if let Some(inventory) = inventories.get(&id) {
-                                inventory.stop();
-                                tracing::debug!("Inventory stopped: {}", id);
-                                if inventories.remove(&id).is_some() {
-                                    tracing::debug!("Inventory removed: {}", id);
+        let message_semaphore = Arc::new(Semaphore::new(CONCURRENT_TASKS));
+
+        loop {
+            tokio::select! {
+                message = self.ws_receiver.recv() => {
+                    match message {
+                        Some(message) => {
+                            match message.content {
+                                WebsocketMessage::TaskRequest(task_request) => {
+                                    let task_tx = task_tx.clone();
+                                    let queue = queue.clone();
+                                    let semaphore = message_semaphore.clone();
+                                    tokio::spawn(async move {
+                                        let _permit = semaphore.acquire().await.unwrap();
+                                        Self::handle_task_request(task_tx, task_request, &queue, message.reply).await;
+                                    });
+                                }
+                                WebsocketMessage::AddInventory(id) => {
+                                    let broker = broker.clone();
+                                    let inventories = inventories.clone();
+                                    let semaphore = message_semaphore.clone();
+                                    tokio::spawn(async move {
+                                        let _permit = semaphore.acquire().await.unwrap();
+                                        Self::handle_add_inventory(id, &broker, &inventories, message.reply).await;
+                                    });
+                                }
+                                WebsocketMessage::RemoveInventory(id) => {
+                                    let inventories = inventories.clone();
+                                    let semaphore = message_semaphore.clone();
+                                    tokio::spawn(async move {
+                                        let _permit = semaphore.acquire().await.unwrap();
+                                        Self::handle_remove_inventory(id, &inventories, message.reply).await;
+                                    });
                                 }
                             }
                         }
-                        _ => tracing::debug!("skipping message: {:?}", message),
-                    },
-                    Err(e) => {
-                        tracing::error!("Error receiving task request: {}", e);
-                        break;
+                        None => {
+                            tracing::debug!("WebSocket receiver channel closed, stopping dispatcher");
+                            break;
+                        }
                     }
                 }
+                _ = &mut shutdown_rx => {
+                    tracing::debug!("Received shutdown signal, stopping dispatcher");
+                    break;
+                }
             }
+        }
 
-            tracing::info!("WebSocket listener stopped.");
-        }));
+        // Perform graceful shutdown
+        self.stop().await;
     }
 
     pub async fn force_stop(&mut self) {
@@ -242,35 +249,285 @@ impl Dispatcher {
     }
 
     pub fn pending_task_count(&self) -> usize {
-        self.queue.lock().unwrap().len()
+        match self.queue.lock() {
+            Ok(queue) => queue.len(),
+            Err(e) => {
+                tracing::error!("Failed to acquire queue lock: {}", e);
+                0
+            }
+        }
     }
 
     pub fn total_task_count(&self) -> usize {
         self.active_task_count() + self.pending_task_count()
     }
+
+    async fn handle_task_request(
+        tx: tokio::sync::broadcast::Sender<InternalMessage>,
+        task_request: crate::actor::model::TaskRequest,
+        queue: &Queue,
+        reply: Option<tokio::sync::oneshot::Sender<Result<String, String>>>,
+    ) {
+        tracing::debug!("Received task request: {:?}", task_request);
+        let task = Task {
+            id: task_request.owner,
+            request_id: task_request.request_id,
+            kind: task_request.kind,
+            respond_to: task_request.respond_to.clone(),
+        };
+
+        // Queue operations are fast, no need for spawn_blocking
+        match queue.lock() {
+            Ok(mut queue) => {
+                queue.push_back(task);
+                let _ = tx.send(InternalMessage::TaskAdded);
+                if let Some(reply_sender) = reply {
+                    let _ = reply_sender.send(Ok("Task request received".to_string()));
+                }
+            }
+            Err(e) => {
+                tracing::error!("Failed to acquire queue lock: {}", e);
+                if let Some(reply_sender) = reply {
+                    let _ = reply_sender.send(Err("Internal error: queue unavailable".to_string()));
+                }
+            }
+        }
+    }
+
+    async fn handle_add_inventory(
+        id: Uuid,
+        broker: &Broker,
+        inventories: &Arc<Mutex<HashMap<Uuid, Inventory>>>,
+        reply: Option<tokio::sync::oneshot::Sender<Result<String, String>>>,
+    ) {
+        tracing::info!("Adding inventory with ID: {}", id);
+
+        let inventories_clone = inventories.clone();
+        let broker_clone = broker.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            match inventories_clone.lock() {
+                Ok(mut inventories) => {
+                    if let std::collections::hash_map::Entry::Vacant(e) = inventories.entry(id) {
+                        let inventory =
+                            Inventory::new(id, broker_clone.topic(INVENTORY_TOPIC).sender.clone());
+                        let inventory_clone = inventory.clone();
+                        e.insert(inventory);
+                        tracing::debug!("New inventory created: {}", id);
+                        Ok((true, Some(inventory_clone))) // needs spawning
+                    } else {
+                        tracing::debug!("Inventory already exists: {}", id);
+                        Ok((false, None)) // (needs_spawn, inventory)
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to acquire inventories lock: {}", e);
+                    Err("Internal error: inventories unavailable".to_string())
+                }
+            }
+        })
+        .await;
+
+        // Handle the result and spawn inventory listener if needed
+        match result {
+            Ok(Ok((needs_spawn, inventory_opt))) => {
+                if needs_spawn {
+                    if let Some(inventory) = inventory_opt {
+                        tokio::spawn(async move { inventory.listen().await });
+                        tracing::debug!("New inventory added and listening: {}", id);
+                        if let Some(reply_sender) = reply {
+                            let _ =
+                                reply_sender.send(Ok("Inventory added and listening".to_string()));
+                        }
+                    }
+                } else if let Some(reply_sender) = reply {
+                    let _ = reply_sender.send(Ok("Inventory already exists".to_string()));
+                }
+            }
+            Ok(Err(e)) => {
+                if let Some(reply_sender) = reply {
+                    let _ = reply_sender.send(Err(e));
+                }
+            }
+            Err(e) => {
+                tracing::error!("Add inventory handler panicked: {}", e);
+                if let Some(reply_sender) = reply {
+                    let _ = reply_sender.send(Err("Internal error: handler failed".to_string()));
+                }
+            }
+        }
+    }
+
+    async fn handle_remove_inventory(
+        id: Uuid,
+        inventories: &Arc<Mutex<HashMap<Uuid, Inventory>>>,
+        reply: Option<tokio::sync::oneshot::Sender<Result<String, String>>>,
+    ) {
+        tracing::debug!("Removing inventory with ID: {}", id);
+
+        let inventories_clone = inventories.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            match inventories_clone.lock() {
+                Ok(mut inventories) => {
+                    // Check existence and remove in a single atomic operation
+                    if let Some(inventory) = inventories.remove(&id) {
+                        inventory.stop();
+                        tracing::debug!("Inventory stopped and removed: {}", id);
+                        Ok(format!("Inventory {id} removed"))
+                    } else {
+                        tracing::warn!("Inventory with ID {} does not exist", id);
+                        Err(format!("Inventory {id} doesn't exist"))
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to acquire inventories lock: {}", e);
+                    Err("Internal error: inventories unavailable".to_string())
+                }
+            }
+        })
+        .await;
+
+        match result {
+            Ok(Ok(msg)) => {
+                if let Some(reply_sender) = reply {
+                    let _ = reply_sender.send(Ok(msg));
+                }
+            }
+            Ok(Err(e)) => {
+                if let Some(reply_sender) = reply {
+                    let _ = reply_sender.send(Err(e));
+                }
+            }
+            Err(e) => {
+                tracing::error!("Remove inventory handler panicked: {}", e);
+                if let Some(reply_sender) = reply {
+                    let _ = reply_sender.send(Err("Internal error: handler failed".to_string()));
+                }
+            }
+        }
+    }
+
+    fn poll_tasks(start_time: tokio::time::Instant, active: usize, pending: usize) -> bool {
+        if active == 0 && pending == 0 {
+            return false;
+        }
+
+        // Check for timeout
+        if start_time.elapsed() > tokio::time::Duration::from_secs(MAX_WAIT_TIME) {
+            tracing::warn!(
+                "Timeout waiting for tasks to complete. Active: {}, Pending: {}. Forcing shutdown.",
+                active,
+                pending
+            );
+            return false;
+        }
+
+        tracing::debug!(
+            "Waiting for tasks to complete... Active: {}, Pending: {} (elapsed: {:?})",
+            active,
+            pending,
+            start_time.elapsed()
+        );
+
+        true
+    }
 }
 
-fn poll_tasks(start_time: tokio::time::Instant, active: usize, pending: usize) -> bool {
-    if active == 0 && pending == 0 {
-        return false;
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    // Check for timeout
-    if start_time.elapsed() > tokio::time::Duration::from_secs(MAX_WAIT_TIME) {
-        tracing::warn!(
-            "Timeout waiting for tasks to complete. Active: {}, Pending: {}. Forcing shutdown.",
-            active,
-            pending
+    #[tokio::test]
+    async fn test_dispatcher_add_inventory() {
+        let broker = Broker::new();
+        let (_tx, rx) = tokio::sync::mpsc::channel::<Message>(100);
+        let dispatcher = Dispatcher::new(broker, rx);
+
+        let id = Uuid::new_v4();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+
+        Dispatcher::handle_add_inventory(
+            id,
+            &dispatcher.broker,
+            &dispatcher.inventories,
+            Some(reply_tx),
+        )
+        .await;
+
+        let response = reply_rx.await.unwrap();
+        assert!(response.is_ok());
+        assert_eq!(
+            response.unwrap(),
+            "Inventory added and listening".to_string()
         );
-        return false;
     }
 
-    tracing::debug!(
-        "Waiting for tasks to complete... Active: {}, Pending: {} (elapsed: {:?})",
-        active,
-        pending,
-        start_time.elapsed()
-    );
+    #[tokio::test]
+    async fn test_dispatcher_remove_inventory() {
+        let broker = Broker::new();
+        let (_tx, rx) = tokio::sync::mpsc::channel::<Message>(100);
+        let dispatcher = Dispatcher::new(broker, rx);
 
-    true
+        let inventory_id = Uuid::new_v4();
+
+        Dispatcher::handle_add_inventory(
+            inventory_id,
+            &dispatcher.broker,
+            &dispatcher.inventories,
+            None,
+        )
+        .await;
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+
+        Dispatcher::handle_remove_inventory(inventory_id, &dispatcher.inventories, Some(reply_tx))
+            .await;
+
+        let response = reply_rx.await.unwrap();
+
+        assert!(response.is_ok());
+        assert_eq!(
+            response.unwrap(),
+            format!("Inventory {inventory_id} removed")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dispatcher_handle_task_request() {
+        let broker = Broker::new();
+        let (_tx, rx) = tokio::sync::mpsc::channel::<Message>(100);
+        let dispatcher = Dispatcher::new(broker, rx);
+        let (response_tx, _response_rx) = tokio::sync::mpsc::channel(100);
+
+        let task_request = crate::actor::model::TaskRequest {
+            owner: Uuid::new_v4(),
+            request_id: "test_request".to_string(),
+            kind: crate::actor::model::TaskKind::Build,
+            respond_to: response_tx.clone(),
+            item: "test_item".to_string(),
+        };
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+
+        Dispatcher::handle_task_request(
+            dispatcher.topic(),
+            task_request,
+            &dispatcher.queue,
+            Some(reply_tx),
+        )
+        .await;
+
+        let response = reply_rx.await.unwrap();
+        assert!(response.is_ok());
+        assert_eq!(response.unwrap(), "Task request received".to_string());
+        assert_eq!(
+            dispatcher
+                .queue
+                .lock()
+                .expect("Failed to acquire queue lock in test_dispatcher_handle_task_request")
+                .len(),
+            1
+        );
+    }
 }

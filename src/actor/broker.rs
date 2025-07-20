@@ -5,7 +5,7 @@ use std::sync::Mutex;
 
 use crate::actor::model::InternalMessage;
 
-pub const WEBSOCKET_TOPIC: &str = "websocket";
+pub const TASK_TOPIC: &str = "task";
 pub const INVENTORY_TOPIC: &str = "inventory";
 
 #[derive(Clone, Debug)]
