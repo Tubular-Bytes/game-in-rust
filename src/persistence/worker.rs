@@ -7,7 +7,7 @@ use std::{
 type MemoryDB = Arc<RwLock<HashMap<String, String>>>;
 
 #[derive(Debug)]
-struct MemoryDBError {
+pub struct MemoryDBError {
     reason: String,
 }
 
@@ -26,7 +26,7 @@ impl Display for MemoryDBError {
 }
 
 #[allow(dead_code)] // TODO remove once persistence is fully implemented
-enum OpType {
+pub enum OpType {
     Stop,
     Set(String, String),
     Delete(String),
@@ -74,14 +74,34 @@ impl PersistenceWorker {
                     }
                 },
                 OpType::Delete(key) => {
-                    let mut db = self.db.write().unwrap();
+                    let mut db = match self.db.write() {
+                        Ok(db) => db,
+                        Err(_) => {
+                            if let Some(reply) = op.reply {
+                                let _ = reply
+                                    .send(Err(MemoryDBError::new("Failed to acquire write lock")));
+                            }
+                            continue;
+                        }
+                    };
+
                     db.remove(&key);
                     if let Some(reply) = op.reply {
                         let _ = reply.send(Ok(format!("{key} deleted")));
                     }
                 }
                 OpType::Get(key) => {
-                    let db = self.db.read().unwrap();
+                    let db = match self.db.read() {
+                        Ok(db) => db,
+                        Err(_) => {
+                            if let Some(reply) = op.reply {
+                                let _ = reply
+                                    .send(Err(MemoryDBError::new("Failed to acquire read lock")));
+                            }
+                            continue;
+                        }
+                    };
+
                     let value = db.get(&key).cloned();
                     let value = value.ok_or(MemoryDBError::new("Key not found"));
                     if let Some(reply) = op.reply {
