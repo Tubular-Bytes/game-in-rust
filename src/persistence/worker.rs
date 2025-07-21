@@ -7,11 +7,21 @@ use std::{
 type MemoryDB = Arc<RwLock<HashMap<String, String>>>;
 
 #[derive(Debug)]
-struct MemoryDBError;
+struct MemoryDBError {
+    reason: String,
+}
+
+impl MemoryDBError {
+    fn new(reason: &str) -> Self {
+        Self {
+            reason: reason.to_string(),
+        }
+    }
+}
 
 impl Display for MemoryDBError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "MemoryDB Error")
+        write!(f, "MemoryDB Error: {}", self.reason)
     }
 }
 
@@ -38,38 +48,48 @@ impl PersistenceWorker {
         Self { db, inbox }
     }
 
-    fn set(&self, key: String, value: String) {
-        let mut db = self.db.write().unwrap();
-        let entry = db.entry(key).or_default();
-        *entry = value;
+    fn set(&self, key: String, value: String) -> Result<(), MemoryDBError> {
+        match self.db.write() {
+            Ok(mut db) => {
+                db.insert(key, value);
+                Ok(())
+            }
+            Err(_) => Err(MemoryDBError::new("Failed to acquire write lock")),
+        }
     }
 
     pub async fn run(&mut self) {
         while let Some(op) = self.inbox.recv().await {
             match op.op_type {
-                OpType::Set(key, value) => {
-                    self.set(key, value);
-                    if let Some(reply) = op.reply {
-                        let _ = reply.send(Ok("{key} set".to_string()));
+                OpType::Set(key, value) => match self.set(key.clone(), value) {
+                    Ok(_) => {
+                        if let Some(reply) = op.reply {
+                            let _ = reply.send(Ok(format!("{key} set")));
+                        }
                     }
-                }
+                    Err(e) => {
+                        if let Some(reply) = op.reply {
+                            let _ = reply.send(Err(e));
+                        }
+                    }
+                },
                 OpType::Delete(key) => {
                     let mut db = self.db.write().unwrap();
                     db.remove(&key);
                     if let Some(reply) = op.reply {
-                        let _ = reply.send(Ok("{key} deleted".to_string()));
+                        let _ = reply.send(Ok(format!("{key} deleted")));
                     }
                 }
                 OpType::Get(key) => {
                     let db = self.db.read().unwrap();
                     let value = db.get(&key).cloned();
-                    let value = value.ok_or(MemoryDBError);
+                    let value = value.ok_or(MemoryDBError::new("Key not found"));
                     if let Some(reply) = op.reply {
                         let _ = reply.send(value);
                     }
                 }
                 OpType::Stop => {
-                    println!("Stopping PersistenceWorker");
+                    tracing::info!("Stopping PersistenceWorker");
                     if let Some(reply) = op.reply {
                         let _ = reply.send(Ok("Worker stopped".to_string()));
                     }
