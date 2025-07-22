@@ -1,29 +1,4 @@
-use std::{
-    collections::HashMap,
-    fmt::Display,
-    sync::{Arc, RwLock},
-};
-
-type MemoryDB = Arc<RwLock<HashMap<String, String>>>;
-
-#[derive(Debug)]
-pub struct MemoryDBError {
-    reason: String,
-}
-
-impl MemoryDBError {
-    fn new(reason: &str) -> Self {
-        Self {
-            reason: reason.to_string(),
-        }
-    }
-}
-
-impl Display for MemoryDBError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "MemoryDB Error: {}", self.reason)
-    }
-}
+use super::error::MemoryDBError;
 
 #[allow(dead_code)] // TODO remove once persistence is fully implemented
 pub enum OpType {
@@ -34,78 +9,70 @@ pub enum OpType {
 }
 
 pub struct Op {
-    op_type: OpType,
-    reply: Option<tokio::sync::oneshot::Sender<Result<String, MemoryDBError>>>,
+    pub op_type: OpType,
+    pub reply: Option<tokio::sync::oneshot::Sender<Result<String, MemoryDBError>>>,
 }
 
 pub struct PersistenceWorker {
-    db: MemoryDB,
+    backend: Box<dyn Persister + 'static + Send>,
+    // Using a channel to receive operations
     inbox: tokio::sync::mpsc::Receiver<Op>,
 }
 
-impl PersistenceWorker {
-    pub fn new(db: MemoryDB, inbox: tokio::sync::mpsc::Receiver<Op>) -> Self {
-        Self { db, inbox }
-    }
+pub trait Persister {
+    fn set(&self, key: String, value: String) -> Result<(), MemoryDBError>;
+    fn delete(&self, key: String) -> Result<(), MemoryDBError>;
+    fn get(&self, key: String) -> Result<String, MemoryDBError>;
+}
 
-    fn set(&self, key: String, value: String) -> Result<(), MemoryDBError> {
-        match self.db.write() {
-            Ok(mut db) => {
-                db.insert(key, value);
-                Ok(())
-            }
-            Err(_) => Err(MemoryDBError::new("Failed to acquire write lock")),
-        }
+impl PersistenceWorker {
+    pub fn new(
+        db: Box<dyn Persister + 'static + Send>,
+        inbox: tokio::sync::mpsc::Receiver<Op>,
+    ) -> Self {
+        Self { inbox, backend: db }
     }
 
     pub async fn run(&mut self) {
         while let Some(op) = self.inbox.recv().await {
             match op.op_type {
-                OpType::Set(key, value) => match self.set(key.clone(), value) {
-                    Ok(_) => {
-                        if let Some(reply) = op.reply {
-                            let _ = reply.send(Ok(format!("{key} set")));
-                        }
-                    }
-                    Err(e) => {
-                        if let Some(reply) = op.reply {
-                            let _ = reply.send(Err(e));
-                        }
-                    }
-                },
-                OpType::Delete(key) => {
-                    let mut db = match self.db.write() {
-                        Ok(db) => db,
-                        Err(_) => {
-                            if let Some(reply) = op.reply {
-                                let _ = reply
-                                    .send(Err(MemoryDBError::new("Failed to acquire write lock")));
-                            }
-                            continue;
-                        }
-                    };
-
-                    db.remove(&key);
+                OpType::Set(key, value) => {
+                    let result = self.backend.set(key, value);
                     if let Some(reply) = op.reply {
-                        let _ = reply.send(Ok(format!("{key} deleted")));
+                        match result {
+                            Ok(_) => {
+                                let _ = reply.send(Ok("Value set successfully".to_string()));
+                            }
+                            Err(e) => {
+                                let _ = reply.send(Err(e));
+                            }
+                        }
+                    }
+                }
+                OpType::Delete(key) => {
+                    let result = self.backend.delete(key);
+                    if let Some(reply) = op.reply {
+                        match result {
+                            Ok(_) => {
+                                let _ = reply.send(Ok("Value deleted successfully".to_string()));
+                            }
+                            Err(e) => {
+                                let _ = reply.send(Err(e));
+                            }
+                        }
                     }
                 }
                 OpType::Get(key) => {
-                    let db = match self.db.read() {
-                        Ok(db) => db,
-                        Err(_) => {
-                            if let Some(reply) = op.reply {
-                                let _ = reply
-                                    .send(Err(MemoryDBError::new("Failed to acquire read lock")));
-                            }
-                            continue;
-                        }
-                    };
-
-                    let value = db.get(&key).cloned();
-                    let value = value.ok_or(MemoryDBError::new("Key not found"));
+                    let result = self.backend.get(key);
                     if let Some(reply) = op.reply {
-                        let _ = reply.send(value);
+                        match result {
+                            Ok(value) => {
+                                let _ = reply.send(Ok(value));
+                            }
+                            Err(e) => {
+                                let _ = reply.send(Err(e));
+                            }
+                        }
                     }
                 }
                 OpType::Stop => {
@@ -123,10 +90,11 @@ impl PersistenceWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::persistence::inmemory::MemoryDatabase;
 
     #[tokio::test]
     async fn test_persistence_handle_insert() {
-        let db: MemoryDB = Arc::new(RwLock::new(HashMap::new()));
+        let db = Box::new(MemoryDatabase::new());
         let (tx, rx) = tokio::sync::mpsc::channel(32);
         let mut worker = PersistenceWorker::new(db.clone(), rx);
 
@@ -144,7 +112,7 @@ mod tests {
 
         assert!(reply_rx.await.is_ok());
 
-        assert_eq!(db.read().unwrap().get("key1"), Some(&"value1".to_string()));
+        assert_eq!(db.get("key1".to_string()).unwrap(), "value1".to_string());
 
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
         tx.send(Op {
@@ -160,13 +128,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_persistence_handle_update() {
-        let db: MemoryDB = Arc::new(RwLock::new(HashMap::new()));
+        let db = Box::new(MemoryDatabase::new());
         let (tx, rx) = tokio::sync::mpsc::channel(32);
         let mut worker = PersistenceWorker::new(db.clone(), rx);
 
-        db.write()
-            .unwrap()
-            .insert("key1".to_string(), "value1".to_string());
+        assert!(db.set("key1".to_string(), "value1".to_string()).is_ok());
 
         let handle = tokio::spawn(async move {
             worker.run().await;
@@ -182,7 +148,7 @@ mod tests {
 
         assert!(update_reply_rx.await.is_ok());
 
-        assert_eq!(db.read().unwrap().get("key1"), Some(&"value2".to_string()));
+        assert_eq!(db.get("key1".to_string()).unwrap(), "value2".to_string());
 
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
         tx.send(Op {
@@ -198,13 +164,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_persistence_handle_delete() {
-        let db: MemoryDB = Arc::new(RwLock::new(HashMap::new()));
+        let db = Box::new(MemoryDatabase::new());
         let (tx, rx) = tokio::sync::mpsc::channel(32);
         let mut worker = PersistenceWorker::new(db.clone(), rx);
 
-        db.write()
-            .unwrap()
-            .insert("key2".to_string(), "value2".to_string());
+        assert!(db.set("key2".to_string(), "value2".to_string()).is_ok());
 
         let handle = tokio::spawn(async move {
             worker.run().await;
@@ -220,7 +184,10 @@ mod tests {
 
         let reply = delete_reply_rx.await.unwrap();
         assert!(reply.is_ok());
-        assert_eq!(db.read().unwrap().get("key2"), None);
+        assert_eq!(
+            db.get("key2".to_string()),
+            Err(MemoryDBError::new("Key not found"))
+        );
 
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
         tx.send(Op {
@@ -236,13 +203,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_persistence_handle_get_existing() {
-        let db: MemoryDB = Arc::new(RwLock::new(HashMap::new()));
+        let db = Box::new(MemoryDatabase::new());
         let (tx, rx) = tokio::sync::mpsc::channel(32);
         let mut worker = PersistenceWorker::new(db.clone(), rx);
 
-        db.write()
-            .unwrap()
-            .insert("key3".to_string(), "value3".to_string());
+        assert!(db.set("key3".to_string(), "value3".to_string()).is_ok());
 
         let handle = tokio::spawn(async move {
             worker.run().await;
@@ -273,7 +238,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_persistence_handle_get_nonexistent() {
-        let db: MemoryDB = Arc::new(RwLock::new(HashMap::new()));
+        let db = Box::new(MemoryDatabase::new());
         let (tx, rx) = tokio::sync::mpsc::channel(32);
         let mut worker = PersistenceWorker::new(db.clone(), rx);
 

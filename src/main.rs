@@ -1,6 +1,7 @@
 use building_game::{
     actor::{broker, dispatcher},
     api::websocket,
+    persistence,
 };
 use std::env;
 use tokio::task::JoinSet;
@@ -12,6 +13,16 @@ async fn main() {
         .finish();
     tracing::subscriber::set_global_default(subscriber).expect("Failed to set global subscriber");
     tracing::info!("Starting the application...");
+
+    let (store_tx, store_rx) = tokio::sync::mpsc::channel(100);
+    let mut persistence = persistence::worker::PersistenceWorker::new(
+        Box::new(persistence::inmemory::MemoryDatabase::new()),
+        store_rx,
+    );
+
+    let persistence_handle = tokio::spawn(async move {
+        persistence.run().await;
+    });
 
     let broker = broker::Broker::new();
     let (ws_tx, ws_rx) = tokio::sync::mpsc::channel(100);
@@ -67,6 +78,20 @@ async fn main() {
     match tokio::time::timeout(tokio::time::Duration::from_secs(10), dispatcher_handle).await {
         Ok(_) => tracing::debug!("Dispatcher stopped successfully."),
         Err(_) => tracing::warn!("Dispatcher shutdown timed out."),
+    }
+
+    tracing::debug!("Signaling dispatcher to stop...");
+    let _ = store_tx
+        .send(persistence::worker::Op {
+            op_type: persistence::worker::OpType::Stop,
+            reply: None,
+        })
+        .await;
+
+    tracing::debug!("Waiting for persister to complete shutdown...");
+    match tokio::time::timeout(tokio::time::Duration::from_secs(10), persistence_handle).await {
+        Ok(_) => tracing::debug!("Persister stopped successfully."),
+        Err(_) => tracing::warn!("Persister shutdown timed out."),
     }
 
     // Close the broadcast channel to signal no more tasks
