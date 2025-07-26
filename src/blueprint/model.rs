@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 pub struct Building {
     pub name: String,
     pub description: String,
@@ -8,7 +10,7 @@ pub struct Building {
     pub production: Option<Production>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Value<T> {
     pub name: String,
     pub value: T,

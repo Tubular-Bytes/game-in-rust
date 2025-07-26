@@ -10,6 +10,7 @@ use crate::actor::broker::{Broker, INVENTORY_TOPIC, TASK_TOPIC};
 use crate::actor::inventory::Inventory;
 use crate::actor::model::{InternalMessage, Message, Queue, Task, WebsocketMessage};
 use crate::actor::worker::spawn_worker;
+use crate::persistence::worker;
 
 const MAX_WAIT_TIME: u64 = 10; // seconds
 const CONCURRENT_TASKS: usize = 10; // Maximum concurrent tasks
@@ -20,24 +21,26 @@ pub struct Dispatcher {
     active_tasks: Arc<AtomicUsize>,
     inventories: Arc<Mutex<HashMap<Uuid, Inventory>>>,
     ws_receiver: tokio::sync::mpsc::Receiver<Message>,
+    persistence_sender: tokio::sync::mpsc::Sender<worker::Op>,
 
     handles: JoinSet<()>,
     task_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Dispatcher {
-    pub fn new(broker: Broker, ws_receiver: tokio::sync::mpsc::Receiver<Message>) -> Self {
+    pub fn new(broker: &Broker, ws_receiver: tokio::sync::mpsc::Receiver<Message>, persistence_sender: &tokio::sync::mpsc::Sender<worker::Op>) -> Self {
         let queue: Queue = Arc::new(Mutex::new(VecDeque::<Task>::new()));
         let handles = JoinSet::new();
         let active_tasks = Arc::new(AtomicUsize::new(0));
         let inventories = Arc::new(Mutex::new(HashMap::new()));
 
         Self {
-            broker,
+            broker: broker.clone(),
             queue,
             active_tasks,
             inventories,
             ws_receiver,
+            persistence_sender: persistence_sender.clone(),
             handles,
             task_handle: None,
         }
@@ -194,9 +197,10 @@ impl Dispatcher {
                                     let broker = broker.clone();
                                     let inventories = inventories.clone();
                                     let semaphore = message_semaphore.clone();
+                                    let persistence_sender = self.persistence_sender.clone();
                                     tokio::spawn(async move {
                                         let _permit = semaphore.acquire().await.unwrap();
-                                        Self::handle_add_inventory(id, &broker, &inventories, message.reply).await;
+                                        Self::handle_add_inventory(id, &broker, &inventories, message.reply, persistence_sender).await;
                                     });
                                 }
                                 WebsocketMessage::RemoveInventory(id) => {
@@ -299,6 +303,7 @@ impl Dispatcher {
         broker: &Broker,
         inventories: &Arc<Mutex<HashMap<Uuid, Inventory>>>,
         reply: Option<tokio::sync::oneshot::Sender<Result<String, String>>>,
+        persistence_sender: tokio::sync::mpsc::Sender<worker::Op>,
     ) {
         tracing::info!("Adding inventory with ID: {}", id);
 
@@ -310,7 +315,7 @@ impl Dispatcher {
                 Ok(mut inventories) => {
                     if let std::collections::hash_map::Entry::Vacant(e) = inventories.entry(id) {
                         let inventory =
-                            Inventory::new(id, broker_clone.topic(INVENTORY_TOPIC).sender.clone());
+                            Inventory::new(id, broker_clone.topic(INVENTORY_TOPIC).sender.clone(), &persistence_sender);
                         let inventory_clone = inventory.clone();
                         e.insert(inventory);
                         tracing::debug!("New inventory created: {}", id);
@@ -441,8 +446,9 @@ mod tests {
     #[tokio::test]
     async fn test_dispatcher_add_inventory() {
         let broker = Broker::new();
+        let persistence_sender = tokio::sync::mpsc::channel(100).0;
         let (_tx, rx) = tokio::sync::mpsc::channel::<Message>(100);
-        let dispatcher = Dispatcher::new(broker, rx);
+        let dispatcher = Dispatcher::new(&broker, rx, &persistence_sender);
 
         let id = Uuid::new_v4();
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -452,6 +458,7 @@ mod tests {
             &dispatcher.broker,
             &dispatcher.inventories,
             Some(reply_tx),
+            persistence_sender.clone(),
         )
         .await;
 
@@ -466,8 +473,9 @@ mod tests {
     #[tokio::test]
     async fn test_dispatcher_remove_inventory() {
         let broker = Broker::new();
+        let persistence_sender = tokio::sync::mpsc::channel(100).0;
         let (_tx, rx) = tokio::sync::mpsc::channel::<Message>(100);
-        let dispatcher = Dispatcher::new(broker, rx);
+        let dispatcher = Dispatcher::new(&broker, rx, &persistence_sender);
 
         let inventory_id = Uuid::new_v4();
 
@@ -476,6 +484,7 @@ mod tests {
             &dispatcher.broker,
             &dispatcher.inventories,
             None,
+            persistence_sender.clone(),
         )
         .await;
 
@@ -496,8 +505,9 @@ mod tests {
     #[tokio::test]
     async fn test_dispatcher_handle_task_request() {
         let broker = Broker::new();
+        let persistence_sender = tokio::sync::mpsc::channel(100).0;
         let (_tx, rx) = tokio::sync::mpsc::channel::<Message>(100);
-        let dispatcher = Dispatcher::new(broker, rx);
+        let dispatcher = Dispatcher::new(&broker, rx, &persistence_sender);
         let (response_tx, _response_rx) = tokio::sync::mpsc::channel(100);
 
         let task_request = crate::actor::model::TaskRequest {

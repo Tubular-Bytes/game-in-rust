@@ -26,7 +26,7 @@ async fn main() {
 
     let broker = broker::Broker::new();
     let (ws_tx, ws_rx) = tokio::sync::mpsc::channel(100);
-    let mut dispatcher = dispatcher::Dispatcher::new(broker, ws_rx);
+    let mut dispatcher = dispatcher::Dispatcher::new(&broker, ws_rx, &store_tx);
     let broker_tx = dispatcher.topic().clone();
 
     // Create a shutdown signal channel

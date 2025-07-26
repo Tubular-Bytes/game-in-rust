@@ -1,9 +1,10 @@
-use crate::{actor::model::InternalMessage, blueprint::model::Value};
+use crate::{actor::model::InternalMessage, blueprint::model::Value, persistence::worker};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
 };
 
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -13,30 +14,71 @@ enum Status {
     Stopping,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Receipt {
     pub id: Uuid,
     pub resources: HashMap<String, Value<u64>>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SerializableInventory {
+    id: Uuid,
+    resources: HashMap<String, Value<u64>>,
+    reserved: HashMap<Uuid, Receipt>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Inventory {
-    id: Uuid,
+    pub id: Uuid,
     status: Arc<Mutex<Status>>,
     pub resources: Arc<Mutex<HashMap<String, Value<u64>>>>,
     pub reserved: Arc<Mutex<HashMap<Uuid, Receipt>>>,
     broker: tokio::sync::broadcast::Sender<InternalMessage>,
+    persistence_tx: tokio::sync::mpsc::Sender<worker::Op>,
 }
 
 impl Inventory {
-    pub fn new(id: Uuid, broker: tokio::sync::broadcast::Sender<InternalMessage>) -> Self {
-        Self {
+    pub fn new(
+        id: Uuid,
+        broker: tokio::sync::broadcast::Sender<InternalMessage>,
+        persistence_tx: &tokio::sync::mpsc::Sender<worker::Op>,
+    ) -> Self {
+        let inventory = Self {
             id,
             status: Arc::new(Mutex::new(Status::Listening)),
             resources: Arc::new(Mutex::new(HashMap::new())),
             reserved: Arc::new(Mutex::new(HashMap::new())),
             broker,
-        }
+            persistence_tx: persistence_tx.clone(),
+        };
+
+        // Spawn a blocking task to restore from persistence
+        let inventory_for_restore = inventory.clone();
+        tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(async {
+                match inventory_for_restore.restore().await {
+                    Ok(()) => {
+                        tracing::info!("Successfully restored inventory {}", inventory_for_restore.id);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to restore inventory {}: {}", inventory_for_restore.id, e);
+                        // Continue with empty inventory if restore fails
+                    }
+                }
+            });
+        });
+
+        inventory
+    }
+
+    pub fn serialize(&self) -> Result<String, serde_json::Error> {
+        let inventory = SerializableInventory {
+            id: self.id,
+            resources: self.resources.lock().unwrap().clone(),
+            reserved: self.reserved.lock().unwrap().clone(),
+        };
+        serde_json::to_string(&inventory)
     }
 
     pub fn id(&self) -> Uuid {
@@ -46,6 +88,60 @@ impl Inventory {
     pub fn stop(&self) {
         let mut status = self.status.lock().unwrap();
         *status = Status::Stopping;
+    }
+
+    pub async fn restore(&self) -> Result<(), String> {
+        tracing::debug!("Attempting to restore inventory {id}", id = self.id);
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let key = format!("inventory:{}", self.id);
+        let op = worker::Op {
+            op_type: worker::OpType::Get(key),
+            reply: Some(reply_tx),
+        };
+        if let Err(e) = self.persistence_tx.send(op).await {
+            tracing::error!("Failed to send restore operation: {}", e);
+            return Err("Failed to send restore operation".to_string());
+        }
+
+        let result = reply_rx.await.map_err(|e| {
+            tracing::error!("Failed to receive restore response: {}", e);
+            "Failed to receive restore response".to_string()
+        })?;
+
+        let values = match result {
+            Ok(value) => value,
+            Err(e) => {
+                tracing::error!("Error restoring inventory: {}", e);
+                return Err("Error restoring inventory".to_string());
+            }
+        };
+
+        let inventory: SerializableInventory = serde_json::from_str(&values.as_str()).map_err(|e| {
+            tracing::error!("Failed to deserialize inventory data: {}", e);
+            "Failed to deserialize inventory data".to_string()
+        })?;
+
+        // try getting locks at once to avoid partial updates
+        let mut resources = self.resources.lock().map_err(|e| {
+            tracing::error!("Failed to lock resources: {}", e);
+            "Failed to lock resources".to_string()
+        })?;
+        let mut reserved = self.reserved.lock().map_err(|e| {
+            tracing::error!("Failed to lock reservations: {}", e);
+            "Failed to lock reservations".to_string()
+        })?;
+
+        // Verify the restored inventory has the same ID
+        if inventory.id != self.id {
+            tracing::warn!("Restored inventory ID ({}) doesn't match expected ID ({})", inventory.id, self.id);
+        }
+        
+        *resources = inventory.resources;
+        *reserved = inventory.reserved;
+
+        tracing::debug!("Inventory restored successfully: {}", self.id);
+
+        Ok(())
     }
 
     pub async fn listen(&self) {
@@ -157,8 +253,9 @@ mod tests {
     #[tokio::test]
     async fn test_reserve_success() {
         let broker = Broker::new();
+        let persistence_tx = tokio::sync::mpsc::channel(100).0;
         let topic = broker.topic(INVENTORY_TOPIC);
-        let inventory = Inventory::new(Uuid::new_v4(), topic.clone().sender.clone());
+        let inventory = Inventory::new(Uuid::new_v4(), topic.clone().sender.clone(), &persistence_tx);
 
         fn wood() -> String {
             "wood".to_string()
@@ -209,9 +306,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_reserve_insufficient_resources() {
+        let persistence_tx = tokio::sync::mpsc::channel(100).0;
         let broker = Broker::new();
         let topic = broker.topic(INVENTORY_TOPIC);
-        let inventory = Inventory::new(Uuid::new_v4(), topic.clone().sender.clone());
+        let inventory = Inventory::new(Uuid::new_v4(), topic.clone().sender.clone(), &persistence_tx);
 
         fn wood() -> String {
             "wood".to_string()
@@ -260,8 +358,9 @@ mod tests {
     #[tokio::test]
     async fn test_inventory_listener_stop() {
         let broker = Broker::new();
+        let persistence_tx = tokio::sync::mpsc::channel(100).0;
         let topic = broker.topic(INVENTORY_TOPIC);
-        let inventory = Inventory::new(Uuid::new_v4(), topic.clone().sender.clone());
+        let inventory = Inventory::new(Uuid::new_v4(), topic.clone().sender.clone(), &persistence_tx);
 
         inventory.listen().await;
 
@@ -282,7 +381,8 @@ mod tests {
     async fn test_inventory_release() {
         let broker = Broker::new();
         let topic = broker.topic(INVENTORY_TOPIC);
-        let inventory = Inventory::new(Uuid::new_v4(), topic.clone().sender.clone());
+        let persistence_tx = tokio::sync::mpsc::channel(100).0;
+        let inventory = Inventory::new(Uuid::new_v4(), topic.clone().sender.clone(), &persistence_tx);
 
         fn wood() -> String {
             "wood".to_string()
@@ -337,7 +437,8 @@ mod tests {
     async fn test_inventory_internal_stop() {
         let broker = Broker::new();
         let topic = broker.topic(INVENTORY_TOPIC);
-        let inventory = Inventory::new(Uuid::new_v4(), topic.clone().sender.clone());
+        let persistence_tx = tokio::sync::mpsc::channel(100).0;
+        let inventory = Inventory::new(Uuid::new_v4(), topic.clone().sender.clone(), &persistence_tx);
 
         inventory.listen().await;
 

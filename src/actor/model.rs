@@ -57,6 +57,10 @@ pub enum InternalMessage {
     InventoryReserveResponse(Result<Uuid, String>),
     InventoryReleaseRequest(Uuid),
     InventoryReleaseResponse(Result<Uuid, String>),
+    InventoryRestoreRequest(Uuid),
+    InventoryRestoreResponse(Result<Uuid, String>),
+    InventoryPersistRequest(Uuid),
+    InventoryPersistResponse(Result<Uuid, String>),
     TaskAdded,
     Stop,
     GracefulStop,
@@ -68,6 +72,7 @@ pub enum WebsocketMessage {
     RemoveInventory(Uuid),
 }
 
+#[derive(Debug)]
 pub struct Message<T = WebsocketMessage> {
     pub id: Uuid,
     pub content: T,
