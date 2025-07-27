@@ -1,41 +1,103 @@
-use building_game::{blueprint::model::Value, persistence::{inmemory::MemoryDatabase, worker::{Op, OpType, PersistenceWorker, Persister}}};
+use building_game::{
+    blueprint::model::Value,
+    persistence::{
+        inmemory::MemoryDatabase,
+        worker::{Op, OpType, PersistenceWorker, Persister},
+    },
+};
+use opentelemetry::trace::TracerProvider;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
 #[tokio::main]
 async fn main() {
-    let subscriber = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .finish();
-    tracing::subscriber::set_global_default(subscriber).expect("Failed to set global subscriber");
-    tracing::info!("Starting the application...");
+    // Initialize OpenTelemetry tracer for Jaeger using OTLP
+    let exporter = opentelemetry_otlp::new_exporter()
+        .tonic()
+        .build_span_exporter()
+        .expect("Failed to create OTLP exporter");
+
+    let resource = opentelemetry_sdk::Resource::new(vec![
+        opentelemetry::KeyValue::new("service.name", "persistence-demo"),
+        opentelemetry::KeyValue::new("service.version", "0.1.0"),
+    ]);
+
+    let tracer_provider = opentelemetry_sdk::trace::TracerProvider::builder()
+        .with_config(opentelemetry_sdk::trace::config().with_resource(resource))
+        .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+        .build();
+
+    // Get the tracer for use with tracing-opentelemetry layer
+    let tracer = tracer_provider.tracer("persistence-demo");
+
+    // Set the global tracer provider for direct OpenTelemetry usage
+    opentelemetry::global::set_tracer_provider(tracer_provider);
+
+    // Create OpenTelemetry layer for tracing
+    let opentelemetry_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+
+    // Create filter specifically for inventory and persistence modules with debug level
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new(
+            "building_game::actor::inventory=debug,building_game::persistence=debug,info",
+        )
+    });
+
+    // Create stdout layer for console output with structured formatting
+    let stdout_layer = tracing_subscriber::fmt::layer()
+        .with_target(true)
+        .with_thread_ids(true)
+        .with_file(true)
+        .with_line_number(true)
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+        .pretty();
+
+    // Combine layers
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(stdout_layer)
+        .with(opentelemetry_layer)
+        .init();
+
+    tracing::info!("Starting persistence demo with enhanced tracing...");
+    tracing::info!("Tracing enabled for inventory and persistence modules");
+    tracing::info!("OTLP endpoint: http://localhost:4318/v1/traces (default)");
 
     let db = MemoryDatabase::new();
 
     let broker = building_game::actor::broker::Broker::new();
     let (store_tx, store_rx) = tokio::sync::mpsc::channel(100);
-    
+
     // Create example inventory data and store it in the database
+    tracing::info!("Creating example inventory data");
     let existing_inventory = example_inventory_data(&store_tx);
+
+    tracing::info!("Storing initial inventory data in persistence layer");
+    let initial_data_span =
+        tracing::info_span!("store_initial_data", inventory_id = %existing_inventory.id);
+    let _enter = initial_data_span.enter();
+
     db.set(
         format!("inventory:{}", existing_inventory.id.clone()),
         existing_inventory.serialize().unwrap(),
-    ).unwrap();
+    )
+    .unwrap();
 
-    let mut persistence = PersistenceWorker::new(
-        Box::new(db),
-        store_rx,
-    );
+    drop(_enter); // Exit the span
+
+    let mut persistence = PersistenceWorker::new(Box::new(db), store_rx);
 
     let persistence_handle = tokio::spawn(async move {
         persistence.run().await;
     });
 
-    // let inventory_id = Uuid::new_v4();
-    // let _inventory = building_game::actor::inventory::Inventory::new(
-    //     inventory_id,
-    //     broker.clone().topic("inventory").sender.clone(),
-    //     &store_tx,
-    // );
+    // Create a new inventory instance that will restore from persistence
+    tracing::info!(
+        "Creating inventory instance - this should trigger restoration from persistence"
+    );
+    let restoration_span =
+        tracing::info_span!("inventory_restoration_demo", inventory_id = %existing_inventory.id);
+    let _enter = restoration_span.enter();
 
     let _inventory = building_game::actor::inventory::Inventory::new(
         existing_inventory.id.clone(),
@@ -43,29 +105,58 @@ async fn main() {
         &store_tx.clone(),
     );
 
+    drop(_enter); // Exit the span
+
     // Give enough time for the inventory to restore its data
     tracing::info!("Waiting for inventory restoration to complete...");
     tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
     tracing::info!("Proceeding to shutdown...");
 
-    store_tx.send(Op{
-        op_type: OpType::Stop,
-        reply: None,
-    }).await.unwrap();
+    store_tx
+        .send(Op {
+            op_type: OpType::Stop,
+            reply: None,
+        })
+        .await
+        .unwrap();
 
     persistence_handle.await.unwrap();
+
+    tracing::info!("Demo completed successfully!");
+
+    // Give time for spans to be exported before shutdown
+    tracing::info!("Waiting for span export to complete...");
+    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+    // Shutdown OpenTelemetry to flush remaining spans
+    opentelemetry::global::shutdown_tracer_provider();
+    tracing::info!("OpenTelemetry tracer shutdown complete.");
 }
 
-fn example_inventory_data(persistence_tx: &tokio::sync::mpsc::Sender<building_game::persistence::worker::Op>) -> building_game::actor::inventory::Inventory {
+#[tracing::instrument(skip(persistence_tx))]
+fn example_inventory_data(
+    persistence_tx: &tokio::sync::mpsc::Sender<building_game::persistence::worker::Op>,
+) -> building_game::actor::inventory::Inventory {
     let id = Uuid::new_v4();
+    tracing::info!("Creating example inventory with ID: {}", id);
+
     let broker = building_game::actor::broker::Broker::new();
-    
-    let inv = building_game::actor::inventory::Inventory::new(id, broker.topic("inventory").sender.clone(), persistence_tx);
 
-    inv.resources.lock().unwrap().insert("wood".to_string(), Value{
-        name: "wood".to_string(),
-        value: 100,
-    });
+    let inv = building_game::actor::inventory::Inventory::new(
+        id,
+        broker.topic("inventory").sender.clone(),
+        persistence_tx,
+    );
 
+    tracing::debug!("Adding 100 wood to example inventory");
+    inv.resources.lock().unwrap().insert(
+        "wood".to_string(),
+        Value {
+            name: "wood".to_string(),
+            value: 100,
+        },
+    );
+
+    tracing::info!("Example inventory data created successfully");
     return inv;
 }

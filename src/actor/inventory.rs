@@ -38,6 +38,7 @@ pub struct Inventory {
 }
 
 impl Inventory {
+    #[tracing::instrument(skip(broker, persistence_tx))]
     pub fn new(
         id: Uuid,
         broker: tokio::sync::broadcast::Sender<InternalMessage>,
@@ -59,10 +60,17 @@ impl Inventory {
             rt.block_on(async {
                 match inventory_for_restore.restore().await {
                     Ok(()) => {
-                        tracing::info!("Successfully restored inventory {}", inventory_for_restore.id);
+                        tracing::info!(
+                            "Successfully restored inventory {}",
+                            inventory_for_restore.id
+                        );
                     }
                     Err(e) => {
-                        tracing::warn!("Failed to restore inventory {}: {}", inventory_for_restore.id, e);
+                        tracing::warn!(
+                            "Failed to restore inventory {}: {}",
+                            inventory_for_restore.id,
+                            e
+                        );
                         // Continue with empty inventory if restore fails
                     }
                 }
@@ -72,33 +80,57 @@ impl Inventory {
         inventory
     }
 
+    #[tracing::instrument(skip(self), fields(inventory_id = %self.id))]
     pub fn serialize(&self) -> Result<String, serde_json::Error> {
+        tracing::debug!("Serializing inventory");
         let inventory = SerializableInventory {
             id: self.id,
             resources: self.resources.lock().unwrap().clone(),
             reserved: self.reserved.lock().unwrap().clone(),
         };
-        serde_json::to_string(&inventory)
+        let result = serde_json::to_string(&inventory);
+        if result.is_ok() {
+            tracing::debug!("Inventory serialization successful");
+        } else {
+            tracing::error!("Inventory serialization failed");
+        }
+        result
     }
 
     pub fn id(&self) -> Uuid {
         self.id
     }
 
+    #[tracing::instrument(skip(self), fields(inventory_id = %self.id))]
     pub fn stop(&self) {
+        tracing::info!("Stopping inventory");
         let mut status = self.status.lock().unwrap();
         *status = Status::Stopping;
+        tracing::debug!("Inventory status set to Stopping");
     }
 
+    #[tracing::instrument(skip(self), fields(inventory_id = %self.id))]
     pub async fn restore(&self) -> Result<(), String> {
+        let restore_span = tracing::info_span!("inventory_restore", inventory_id = %self.id);
+        let _enter = restore_span.enter();
+
+        tracing::info!("Starting inventory restore process");
         tracing::debug!("Attempting to restore inventory {id}", id = self.id);
+
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         let key = format!("inventory:{}", self.id);
+        tracing::debug!("Persistence key: {}", key);
+
         let op = worker::Op {
-            op_type: worker::OpType::Get(key),
+            op_type: worker::OpType::Get(key.clone()),
             reply: Some(reply_tx),
         };
-        if let Err(e) = self.persistence_tx.send(op).await {
+
+        let persistence_span = tracing::debug_span!("send_persistence_request", key = %key);
+        if let Err(e) = persistence_span
+            .in_scope(|| async { self.persistence_tx.send(op).await })
+            .await
+        {
             tracing::error!("Failed to send restore operation: {}", e);
             return Err("Failed to send restore operation".to_string());
         }
@@ -109,42 +141,113 @@ impl Inventory {
         })?;
 
         let values = match result {
-            Ok(value) => value,
+            Ok(value) => {
+                tracing::debug!("Successfully received data from persistence layer");
+                value
+            }
             Err(e) => {
                 tracing::error!("Error restoring inventory: {}", e);
                 return Err("Error restoring inventory".to_string());
             }
         };
 
-        let inventory: SerializableInventory = serde_json::from_str(&values.as_str()).map_err(|e| {
-            tracing::error!("Failed to deserialize inventory data: {}", e);
-            "Failed to deserialize inventory data".to_string()
+        let deserialize_span = tracing::debug_span!("deserialize_inventory");
+        let inventory: SerializableInventory = deserialize_span.in_scope(|| {
+            serde_json::from_str(values.as_str()).map_err(|e| {
+                tracing::error!("Failed to deserialize inventory data: {}", e);
+                "Failed to deserialize inventory data".to_string()
+            })
         })?;
 
         // try getting locks at once to avoid partial updates
-        let mut resources = self.resources.lock().map_err(|e| {
-            tracing::error!("Failed to lock resources: {}", e);
-            "Failed to lock resources".to_string()
-        })?;
-        let mut reserved = self.reserved.lock().map_err(|e| {
-            tracing::error!("Failed to lock reservations: {}", e);
-            "Failed to lock reservations".to_string()
+        let lock_span = tracing::debug_span!("acquire_locks");
+        let (mut resources, mut reserved) = lock_span.in_scope(|| {
+            let resources = self.resources.lock().map_err(|e| {
+                tracing::error!("Failed to lock resources: {}", e);
+                "Failed to lock resources".to_string()
+            })?;
+            let reserved = self.reserved.lock().map_err(|e| {
+                tracing::error!("Failed to lock reservations: {}", e);
+                "Failed to lock reservations".to_string()
+            })?;
+            Ok::<_, String>((resources, reserved))
         })?;
 
         // Verify the restored inventory has the same ID
         if inventory.id != self.id {
-            tracing::warn!("Restored inventory ID ({}) doesn't match expected ID ({})", inventory.id, self.id);
+            tracing::warn!(
+                "Restored inventory ID ({}) doesn't match expected ID ({})",
+                inventory.id,
+                self.id
+            );
         }
-        
+
         *resources = inventory.resources;
         *reserved = inventory.reserved;
 
+        tracing::info!(
+            "Inventory restore completed successfully - {} resources, {} reservations",
+            resources.len(),
+            reserved.len()
+        );
         tracing::debug!("Inventory restored successfully: {}", self.id);
 
         Ok(())
     }
 
+    #[tracing::instrument(skip(self), fields(inventory_id = %self.id))]
+    pub async fn persist(&self) -> Result<(), String> {
+        let persist_span = tracing::info_span!("inventory_persist", inventory_id = %self.id);
+        let _enter = persist_span.enter();
+
+        tracing::info!("Starting inventory persistence");
+
+        let serialize_span = tracing::debug_span!("serialize_inventory");
+        let serialized = serialize_span.in_scope(|| {
+            self.serialize().map_err(|e| {
+                tracing::error!("Failed to serialize inventory for persistence: {}", e);
+                format!("Serialization failed: {e}")
+            })
+        })?;
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let key = format!("inventory:{}", self.id);
+        tracing::debug!("Persisting inventory with key: {}", key);
+
+        let op = worker::Op {
+            op_type: worker::OpType::Set(key.clone(), serialized),
+            reply: Some(reply_tx),
+        };
+
+        let persistence_span = tracing::debug_span!("send_persistence_request", key = %key);
+        if let Err(e) = persistence_span
+            .in_scope(|| async { self.persistence_tx.send(op).await })
+            .await
+        {
+            tracing::error!("Failed to send persist operation: {}", e);
+            return Err("Failed to send persist operation".to_string());
+        }
+
+        let result = reply_rx.await.map_err(|e| {
+            tracing::error!("Failed to receive persist response: {}", e);
+            "Failed to receive persist response".to_string()
+        })?;
+
+        match result {
+            Ok(_) => {
+                tracing::info!("Inventory persistence completed successfully");
+                Ok(())
+            }
+            Err(e) => {
+                tracing::error!("Persistence operation failed: {:?}", e);
+                Err("Persistence operation failed".to_string())
+            }
+        }
+    }
+
+    #[tracing::instrument(skip(self), fields(inventory_id = %self.id))]
     pub async fn listen(&self) {
+        tracing::info!("Starting inventory listener");
         tracing::debug!("Listening for inventory updates for ID: {}", self.id);
         let mut receiver = self.broker.subscribe();
         let sender = self.broker.clone();
@@ -167,6 +270,13 @@ impl Inventory {
                     msg = receiver.recv() => {
                         match msg {
                             Ok(InternalMessage::InventoryReserveRequest(request)) => {
+                                let reserve_span = tracing::info_span!(
+                                    "inventory_reserve_request",
+                                    inventory_id = %id,
+                                    resource_count = request.len()
+                                );
+                                let _enter = reserve_span.enter();
+
                                 tracing::debug!("Received inventory reserve request: {:?}", request);
                                 tracing::debug!("resources: {:?} | reserved: {:?}", resources, reserved);
 
@@ -192,15 +302,22 @@ impl Inventory {
                                         resources: request.clone(),
                                     });
 
-                                    tracing::debug!("Resources reserved successfully with receipt: {}", receipt_id);
+                                    tracing::info!("Resources reserved successfully with receipt: {}", receipt_id);
                                     let _ = sender.send(InternalMessage::InventoryReserveResponse(Ok(receipt_id)));
 
                                 } else {
-                                    tracing::debug!("Insufficient resources for request: {:?}", request);
+                                    tracing::warn!("Insufficient resources for request: {:?}", request);
                                     let _ = sender.send(InternalMessage::InventoryReserveResponse(Err("insufficient resources".to_string())));
                                 }
                             }
                             Ok(InternalMessage::InventoryReleaseRequest(id)) => {
+                                let release_span = tracing::info_span!(
+                                    "inventory_release_request",
+                                    inventory_id = %id,
+                                    receipt_id = %id
+                                );
+                                let _enter = release_span.enter();
+
                                 tracing::debug!("Received inventory release request: {:?}", id);
                                 let mut resource_lock = resources.lock().unwrap();
                                 let mut reserve_lock = reserved.lock().unwrap();
@@ -214,11 +331,11 @@ impl Inventory {
                                             });
                                         }
                                         reserve_lock.remove(&id);
-                                        tracing::debug!("Resources released successfully for receipt: {}", id);
+                                        tracing::info!("Resources released successfully for receipt: {}", id);
                                         let _ = sender.send(InternalMessage::InventoryReleaseResponse(Ok(id)));
                                     }
                                     None => {
-                                        tracing::debug!("No reservation found for ID: {}", id);
+                                        tracing::warn!("No reservation found for ID: {}", id);
                                         let _ = sender.send(InternalMessage::InventoryReleaseResponse(Err("no reservation found".to_string())));
                                     }
                                 }
@@ -255,7 +372,11 @@ mod tests {
         let broker = Broker::new();
         let persistence_tx = tokio::sync::mpsc::channel(100).0;
         let topic = broker.topic(INVENTORY_TOPIC);
-        let inventory = Inventory::new(Uuid::new_v4(), topic.clone().sender.clone(), &persistence_tx);
+        let inventory = Inventory::new(
+            Uuid::new_v4(),
+            topic.clone().sender.clone(),
+            &persistence_tx,
+        );
 
         fn wood() -> String {
             "wood".to_string()
@@ -309,7 +430,11 @@ mod tests {
         let persistence_tx = tokio::sync::mpsc::channel(100).0;
         let broker = Broker::new();
         let topic = broker.topic(INVENTORY_TOPIC);
-        let inventory = Inventory::new(Uuid::new_v4(), topic.clone().sender.clone(), &persistence_tx);
+        let inventory = Inventory::new(
+            Uuid::new_v4(),
+            topic.clone().sender.clone(),
+            &persistence_tx,
+        );
 
         fn wood() -> String {
             "wood".to_string()
@@ -360,7 +485,11 @@ mod tests {
         let broker = Broker::new();
         let persistence_tx = tokio::sync::mpsc::channel(100).0;
         let topic = broker.topic(INVENTORY_TOPIC);
-        let inventory = Inventory::new(Uuid::new_v4(), topic.clone().sender.clone(), &persistence_tx);
+        let inventory = Inventory::new(
+            Uuid::new_v4(),
+            topic.clone().sender.clone(),
+            &persistence_tx,
+        );
 
         inventory.listen().await;
 
@@ -382,7 +511,11 @@ mod tests {
         let broker = Broker::new();
         let topic = broker.topic(INVENTORY_TOPIC);
         let persistence_tx = tokio::sync::mpsc::channel(100).0;
-        let inventory = Inventory::new(Uuid::new_v4(), topic.clone().sender.clone(), &persistence_tx);
+        let inventory = Inventory::new(
+            Uuid::new_v4(),
+            topic.clone().sender.clone(),
+            &persistence_tx,
+        );
 
         fn wood() -> String {
             "wood".to_string()
@@ -438,7 +571,11 @@ mod tests {
         let broker = Broker::new();
         let topic = broker.topic(INVENTORY_TOPIC);
         let persistence_tx = tokio::sync::mpsc::channel(100).0;
-        let inventory = Inventory::new(Uuid::new_v4(), topic.clone().sender.clone(), &persistence_tx);
+        let inventory = Inventory::new(
+            Uuid::new_v4(),
+            topic.clone().sender.clone(),
+            &persistence_tx,
+        );
 
         inventory.listen().await;
 

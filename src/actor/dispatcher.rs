@@ -28,7 +28,11 @@ pub struct Dispatcher {
 }
 
 impl Dispatcher {
-    pub fn new(broker: &Broker, ws_receiver: tokio::sync::mpsc::Receiver<Message>, persistence_sender: &tokio::sync::mpsc::Sender<worker::Op>) -> Self {
+    pub fn new(
+        broker: &Broker,
+        ws_receiver: tokio::sync::mpsc::Receiver<Message>,
+        persistence_sender: &tokio::sync::mpsc::Sender<worker::Op>,
+    ) -> Self {
         let queue: Queue = Arc::new(Mutex::new(VecDeque::<Task>::new()));
         let handles = JoinSet::new();
         let active_tasks = Arc::new(AtomicUsize::new(0));
@@ -314,8 +318,11 @@ impl Dispatcher {
             match inventories_clone.lock() {
                 Ok(mut inventories) => {
                     if let std::collections::hash_map::Entry::Vacant(e) = inventories.entry(id) {
-                        let inventory =
-                            Inventory::new(id, broker_clone.topic(INVENTORY_TOPIC).sender.clone(), &persistence_sender);
+                        let inventory = Inventory::new(
+                            id,
+                            broker_clone.topic(INVENTORY_TOPIC).sender.clone(),
+                            &persistence_sender,
+                        );
                         let inventory_clone = inventory.clone();
                         e.insert(inventory);
                         tracing::debug!("New inventory created: {}", id);

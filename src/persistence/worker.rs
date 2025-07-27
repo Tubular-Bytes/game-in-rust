@@ -33,50 +33,87 @@ impl PersistenceWorker {
         Self { inbox, backend: db }
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn run(&mut self) {
+        tracing::info!("Starting persistence worker");
         while let Some(op) = self.inbox.recv().await {
             match op.op_type {
                 OpType::Set(key, value) => {
-                    let result = self.backend.set(key, value);
+                    let set_span = tracing::info_span!("persistence_set",
+                        key = %key,
+                        value_size = value.len(),
+                        operation = "SET"
+                    );
+                    let _enter = set_span.enter();
+
+                    tracing::debug!("Processing SET operation for key: {}", key);
+
+                    let result = self.backend.set(key.clone(), value.clone());
                     if let Some(reply) = op.reply {
                         match result {
                             Ok(_) => {
+                                tracing::info!("SET operation successful for key: {}", key);
                                 let _ = reply.send(Ok("Value set successfully".to_string()));
                             }
                             Err(e) => {
+                                tracing::error!("SET operation failed for key {}: {:?}", key, e);
                                 let _ = reply.send(Err(e));
                             }
                         }
                     }
                 }
                 OpType::Delete(key) => {
-                    let result = self.backend.delete(key);
+                    let delete_span = tracing::info_span!("persistence_delete",
+                        key = %key,
+                        operation = "DELETE"
+                    );
+                    let _enter = delete_span.enter();
+
+                    tracing::debug!("Processing DELETE operation for key: {}", key);
+
+                    let result = self.backend.delete(key.clone());
                     if let Some(reply) = op.reply {
                         match result {
                             Ok(_) => {
+                                tracing::info!("DELETE operation successful for key: {}", key);
                                 let _ = reply.send(Ok("Value deleted successfully".to_string()));
                             }
                             Err(e) => {
+                                tracing::error!("DELETE operation failed for key {}: {:?}", key, e);
                                 let _ = reply.send(Err(e));
                             }
                         }
                     }
                 }
                 OpType::Get(key) => {
-                    let result = self.backend.get(key);
+                    let get_span = tracing::info_span!("persistence_get",
+                        key = %key,
+                        operation = "GET"
+                    );
+                    let _enter = get_span.enter();
+
+                    tracing::debug!("Processing GET operation for key: {}", key);
+
+                    let result = self.backend.get(key.clone());
                     if let Some(reply) = op.reply {
                         match result {
                             Ok(value) => {
+                                tracing::info!(
+                                    "GET operation successful for key: {}, value length: {}",
+                                    key,
+                                    value.len()
+                                );
                                 let _ = reply.send(Ok(value));
                             }
                             Err(e) => {
+                                tracing::error!("GET operation failed for key {}: {:?}", key, e);
                                 let _ = reply.send(Err(e));
                             }
                         }
                     }
                 }
                 OpType::Stop => {
-                    tracing::info!("Stopping PersistenceWorker");
+                    tracing::info!("Stopping PersistenceWorker - shutdown signal received");
                     if let Some(reply) = op.reply {
                         let _ = reply.send(Ok("Worker stopped".to_string()));
                     }
@@ -84,6 +121,7 @@ impl PersistenceWorker {
                 }
             }
         }
+        tracing::info!("Persistence worker shutdown complete");
     }
 }
 

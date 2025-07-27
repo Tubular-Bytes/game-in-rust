@@ -3,16 +3,64 @@ use building_game::{
     api::websocket,
     persistence,
 };
+use opentelemetry::trace::TracerProvider;
 use std::env;
 use tokio::task::JoinSet;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
 async fn main() {
-    let subscriber = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .finish();
-    tracing::subscriber::set_global_default(subscriber).expect("Failed to set global subscriber");
-    tracing::info!("Starting the application...");
+    // Initialize OpenTelemetry tracer for Jaeger using OTLP
+    let exporter = opentelemetry_otlp::new_exporter()
+        .tonic()
+        .build_span_exporter()
+        .expect("Failed to create OTLP exporter");
+
+    let resource = opentelemetry_sdk::Resource::new(vec![
+        opentelemetry::KeyValue::new("service.name", "game-in-rust"),
+        opentelemetry::KeyValue::new("service.version", "0.1.0"),
+    ]);
+
+    let tracer_provider = opentelemetry_sdk::trace::TracerProvider::builder()
+        .with_config(opentelemetry_sdk::trace::config().with_resource(resource))
+        .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+        .build();
+
+    // Get the tracer for use with tracing-opentelemetry layer
+    let tracer = tracer_provider.tracer("game-in-rust");
+
+    // Set the global tracer provider for direct OpenTelemetry usage
+    opentelemetry::global::set_tracer_provider(tracer_provider);
+
+    // Create OpenTelemetry layer for tracing
+    let opentelemetry_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+
+    // Create filter specifically for inventory and persistence modules with debug level
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new(
+            "building_game::actor::inventory=debug,building_game::persistence=debug,info",
+        )
+    });
+
+    // Create stdout layer for console output with structured formatting
+    let stdout_layer = tracing_subscriber::fmt::layer()
+        .with_target(true)
+        .with_thread_ids(true)
+        .with_file(true)
+        .with_line_number(true)
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+        .pretty();
+
+    // Combine layers
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(stdout_layer)
+        .with(opentelemetry_layer)
+        .init();
+
+    tracing::info!("Starting the application with enhanced tracing...");
+    tracing::info!("Tracing enabled for inventory and persistence modules");
+    tracing::info!("OTLP endpoint: http://localhost:4318/v1/traces (default)");
 
     let (store_tx, store_rx) = tokio::sync::mpsc::channel(100);
     let mut persistence = persistence::worker::PersistenceWorker::new(
@@ -129,4 +177,12 @@ async fn main() {
 
     tracing::debug!("All workers have been stopped.");
     tracing::info!("Shutting down daemon...");
+
+    // Give time for spans to be exported before shutdown
+    tracing::info!("Waiting for span export to complete...");
+    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+    // Shutdown OpenTelemetry to flush remaining spans
+    opentelemetry::global::shutdown_tracer_provider();
+    tracing::info!("OpenTelemetry tracer shutdown complete.");
 }
