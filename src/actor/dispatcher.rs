@@ -322,6 +322,7 @@ impl Dispatcher {
                             id,
                             broker_clone.topic(INVENTORY_TOPIC).sender.clone(),
                             &persistence_sender,
+                            None,
                         );
                         let inventory_clone = inventory.clone();
                         e.insert(inventory);

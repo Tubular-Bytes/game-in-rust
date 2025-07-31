@@ -8,8 +8,8 @@ use building_game::{
     },
 };
 use opentelemetry::{
-    global,
-    trace::{Span, SpanContext, TraceContextExt, Tracer, TracerProvider}, Context,
+    Context, global,
+    trace::{Span, SpanContext, TraceContextExt, Tracer, TracerProvider},
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
@@ -82,27 +82,28 @@ async fn main() {
         "span.context.span_id" = cx.span_id().to_string(),
         "span.context.trace_id" = cx.trace_id().to_string(),
         "span.context.is_remote" = cx.is_remote().to_string(),
-        // "span.context.trace_flags" = cx.trace_flags(),
-        // "span.context.trace_state" = cx.trace_state().to_string(),
-        
         "span context created"
     );
 
     // Create example inventory data and store it in the database
     span.add_event("creating example inventory data", vec![]);
-    let existing_inventory = example_inventory_data(&cx, &store_tx);
+    let existing_inventory = fake_inventory_data(&cx);
 
     span.set_attribute(opentelemetry::KeyValue::new(
         "inventory.id",
         existing_inventory.id.to_string(),
     ));
 
-    span.add_event("store example data", vec![
-        opentelemetry::KeyValue::new("inventory.id", existing_inventory.id.to_string()),
-    ]);
+    span.add_event(
+        "store example data",
+        vec![opentelemetry::KeyValue::new(
+            "inventory.id",
+            existing_inventory.id.to_string(),
+        )],
+    );
 
     db.set(
-        Some(cx),
+        Some(cx.clone()),
         format!("inventory:{}", existing_inventory.id.clone()),
         existing_inventory.serialize().unwrap(),
     )
@@ -116,7 +117,7 @@ async fn main() {
 
     // Create a new inventory instance that will restore from persistence
     span.add_event(
-        "creating new inventory instance",
+        "attempting to create inventory with existing data triggering a restore",
         vec![opentelemetry::KeyValue::new(
             "inventory.id",
             existing_inventory.id.to_string(),
@@ -127,6 +128,24 @@ async fn main() {
         existing_inventory.id.clone(),
         broker.clone().topic("inventory").sender.clone(),
         &store_tx.clone(),
+        Some(cx.clone()),
+    );
+
+    // Create a new inventory instance that will restore from persistence
+    let nonexistent_inventory_id = Uuid::new_v4();
+    span.add_event(
+        "attempting to create a new inventory instance",
+        vec![opentelemetry::KeyValue::new(
+            "inventory.id",
+            nonexistent_inventory_id.to_string(),
+        )],
+    );
+
+    let _inventory = building_game::actor::inventory::Inventory::new(
+        nonexistent_inventory_id.clone(),
+        broker.clone().topic("inventory").sender.clone(),
+        &store_tx.clone(),
+        Some(cx.clone()),
     );
 
     // Give enough time for the inventory to restore its data
@@ -161,7 +180,7 @@ async fn main() {
     tracing::info!("OpenTelemetry tracer shutdown complete.");
 }
 
-fn example_inventory_data(
+fn _example_inventory_data(
     cx: &SpanContext,
     persistence_tx: &tokio::sync::mpsc::Sender<building_game::persistence::worker::Op>,
 ) -> building_game::actor::inventory::Inventory {
@@ -173,30 +192,37 @@ fn example_inventory_data(
         "span.context.span_id" = span.span_context().span_id().to_string(),
         "span.context.trace_id" = span.span_context().trace_id().to_string(),
         "span.context.is_remote" = span.span_context().is_remote().to_string(),
-        // "span.context.trace_flags" = span.span_context().trace_flags(),
-        // "span.context.trace_state" = span.span_context().trace_state().to_string(),
-        
         "span context created"
     );
 
     let id = Uuid::new_v4();
-    span.add_event("creating example inventory", vec![
-        opentelemetry::KeyValue::new("inventory.id", id.to_string()),
-    ]);
+    span.add_event(
+        "creating example inventory",
+        vec![opentelemetry::KeyValue::new("inventory.id", id.to_string())],
+    );
 
     let broker = building_game::actor::broker::Broker::new();
+
+    tracing::info!(
+        "span id for creating inventory data: {}",
+        span.span_context().span_id()
+    );
 
     let inv = building_game::actor::inventory::Inventory::new(
         id,
         broker.topic("inventory").sender.clone(),
         persistence_tx,
+        Some(span.span_context().clone()),
     );
 
-    span.add_event("adding resource to inventory", vec![
-        opentelemetry::KeyValue::new("inventory.id", id.to_string()),
-        opentelemetry::KeyValue::new("resource.name", "wood".to_string()),
-        opentelemetry::KeyValue::new("resource.value", 100.to_string()),
-        ]);
+    span.add_event(
+        "adding resource to inventory",
+        vec![
+            opentelemetry::KeyValue::new("inventory.id", id.to_string()),
+            opentelemetry::KeyValue::new("resource.name", "wood".to_string()),
+            opentelemetry::KeyValue::new("resource.value", 100.to_string()),
+        ],
+    );
     inv.resources.lock().unwrap().insert(
         "wood".to_string(),
         Value {
@@ -206,9 +232,47 @@ fn example_inventory_data(
     );
 
     tracing::info!("Example inventory data created successfully");
-    
+
     // End the span before returning
     span.end();
-    
+
+    return inv;
+}
+
+fn fake_inventory_data(cx: &SpanContext) -> building_game::actor::inventory::Inventory {
+    let tracer = global::tracer("persistence-demo.example_inventory_data");
+    let context = Context::current().with_remote_span_context(cx.clone());
+    let mut span = tracer.start_with_context("persistence-demo.example", &context);
+
+    let id = Uuid::new_v4();
+    span.add_event(
+        "creating example inventory",
+        vec![opentelemetry::KeyValue::new("inventory.id", id.to_string())],
+    );
+
+    let mut inv = building_game::actor::inventory::Inventory::default();
+    inv.id = id;
+
+    span.add_event(
+        "adding resource to inventory",
+        vec![
+            opentelemetry::KeyValue::new("inventory.id", id.to_string()),
+            opentelemetry::KeyValue::new("resource.name", "wood".to_string()),
+            opentelemetry::KeyValue::new("resource.value", 100.to_string()),
+        ],
+    );
+    inv.resources.lock().unwrap().insert(
+        "wood".to_string(),
+        Value {
+            name: "wood".to_string(),
+            value: 100,
+        },
+    );
+
+    tracing::info!("Example inventory data created successfully");
+
+    // End the span before returning
+    span.end();
+
     return inv;
 }

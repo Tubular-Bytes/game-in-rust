@@ -3,7 +3,10 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use opentelemetry::{global, trace::{Span, Status, TraceContextExt, Tracer}, Context, KeyValue};
+use opentelemetry::{
+    Context, KeyValue, global,
+    trace::{Span, Status, TraceContextExt, Tracer},
+};
 
 use crate::persistence::{error::MemoryDBError, worker::Persister};
 
@@ -44,11 +47,14 @@ impl Persister for MemoryDatabase {
             "setting value in memory database",
             vec![
                 KeyValue::new("key", key.clone()),
-                KeyValue::new("value.size", value.len() as i64)
+                KeyValue::new("value.size", value.len() as i64),
             ],
         );
         let mut db = self.db.write().map_err(|_| {
-            span.add_event("failed to acquire write lock for key", vec![KeyValue::new("key", key.clone())]);
+            span.add_event(
+                "failed to acquire write lock for key",
+                vec![KeyValue::new("key", key.clone())],
+            );
             span.set_status(Status::error("failed to acquire write lock"));
             span.end();
             MemoryDBError::new("Failed to acquire write lock")
@@ -70,7 +76,10 @@ impl Persister for MemoryDatabase {
         let mut span = tracer.start_with_context("persistence.inmemory.set", &context);
 
         let mut db = self.db.write().map_err(|_| {
-            span.add_event("failed to acquire write lock for key", vec![KeyValue::new("key", key.clone())]);
+            span.add_event(
+                "failed to acquire write lock for key",
+                vec![KeyValue::new("key", key.clone())],
+            );
             span.set_status(Status::error("failed to acquire write lock"));
             span.end();
             MemoryDBError::new("Failed to acquire write lock")
@@ -94,11 +103,17 @@ impl Persister for MemoryDatabase {
         let mut span = tracer.start_with_context("persistence.inmemory.set", &context);
 
         let db = self.db.read().map_err(|_| {
-            span.add_event("failed to acquire read lock for key", vec![KeyValue::new("key", key.clone())]);
+            span.add_event(
+                "failed to acquire read lock for key",
+                vec![KeyValue::new("key", key.clone())],
+            );
             span.set_status(Status::error("failed to acquire read lock"));
             span.end();
             MemoryDBError::new("Failed to acquire read lock")
         })?;
+
+        tracing::info!("keys in memory database: {:?}", db.keys());
+
         match db.get(&key) {
             Some(value) => {
                 span.add_event(

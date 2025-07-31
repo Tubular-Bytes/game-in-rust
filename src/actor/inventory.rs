@@ -5,7 +5,8 @@ use std::{
 };
 
 use opentelemetry::{
-    global, trace::{Span, TraceContextExt, Tracer}, Context, KeyValue
+    Context, KeyValue, global,
+    trace::{Span, SpanContext, TraceContextExt, Tracer},
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -36,8 +37,21 @@ pub struct Inventory {
     status: Arc<Mutex<Status>>,
     pub resources: Arc<Mutex<HashMap<String, Value<u64>>>>,
     pub reserved: Arc<Mutex<HashMap<Uuid, Receipt>>>,
-    broker: tokio::sync::broadcast::Sender<InternalMessage>,
-    persistence_tx: tokio::sync::mpsc::Sender<worker::Op>,
+    broker: Option<tokio::sync::broadcast::Sender<InternalMessage>>,
+    persistence_tx: Option<tokio::sync::mpsc::Sender<worker::Op>>,
+}
+
+impl Default for Inventory {
+    fn default() -> Self {
+        Self {
+            id: Uuid::nil(),
+            status: Arc::new(Mutex::new(Status::Listening)),
+            resources: Arc::new(Mutex::new(HashMap::new())),
+            reserved: Arc::new(Mutex::new(HashMap::new())),
+            broker: None,
+            persistence_tx: None,
+        }
+    }
 }
 
 impl Inventory {
@@ -45,18 +59,23 @@ impl Inventory {
         id: Uuid,
         broker: tokio::sync::broadcast::Sender<InternalMessage>,
         persistence_tx: &tokio::sync::mpsc::Sender<worker::Op>,
+        cx: Option<SpanContext>,
     ) -> Self {
         let inventory = Self {
             id,
             status: Arc::new(Mutex::new(Status::Listening)),
             resources: Arc::new(Mutex::new(HashMap::new())),
             reserved: Arc::new(Mutex::new(HashMap::new())),
-            broker,
-            persistence_tx: persistence_tx.clone(),
+            broker: Some(broker),
+            persistence_tx: Some(persistence_tx.clone()),
         };
 
         let tracer = global::tracer("inventory_new");
-        let mut span = tracer.start("inventory.new");
+
+        let parent_cx = cx.unwrap_or_else(SpanContext::empty_context);
+        let context = Context::current().with_remote_span_context(parent_cx);
+
+        let mut span = tracer.start_with_context("inventory.new", &context);
         span.set_attribute(KeyValue::new("inventory.id", inventory.id.to_string()));
 
         let span_context = span.span_context().clone();
@@ -121,6 +140,16 @@ impl Inventory {
         let cx = Context::current().with_remote_span_context(ctx.clone());
         let mut restore_span = tracer.start_with_context("inventory.restore", &cx);
 
+        if self.persistence_tx.is_none() {
+            restore_span.set_status(opentelemetry::trace::Status::error(
+                "Persistence channel not set",
+            ));
+            restore_span.end();
+            return Err("Persistence channel not set".to_string());
+        }
+
+        let persistence_tx = self.persistence_tx.as_ref().unwrap();
+
         tracing::info!("Starting inventory restore process");
         tracing::debug!("Attempting to restore inventory {id}", id = self.id);
 
@@ -136,11 +165,7 @@ impl Inventory {
             span_context: Some(span_context),
         };
 
-        let persistence_span = tracing::debug_span!("send_persistence_request", key = %key);
-        if let Err(e) = persistence_span
-            .in_scope(|| async { self.persistence_tx.send(op).await })
-            .await
-        {
+        if let Err(e) = persistence_tx.send(op).await {
             tracing::error!("Failed to send restore operation: {}", e);
             return Err("Failed to send restore operation".to_string());
         }
@@ -149,6 +174,8 @@ impl Inventory {
             tracing::error!("Failed to receive restore response: {}", e);
             "Failed to receive restore response".to_string()
         })?;
+
+        tracing::info!("raw response from persistence: {:?}", result);
 
         let values = match result {
             Ok(value) => {
@@ -209,6 +236,13 @@ impl Inventory {
         let persist_span = tracing::info_span!("inventory_persist", inventory_id = %self.id);
         let _enter = persist_span.enter();
 
+        if self.persistence_tx.is_none() {
+            tracing::error!("Persistence channel not set");
+            return Err("Persistence channel not set".to_string());
+        }
+
+        let persistence_tx = self.persistence_tx.as_ref().unwrap();
+
         tracing::info!("Starting inventory persistence");
 
         let serialize_span = tracing::debug_span!("serialize_inventory");
@@ -231,7 +265,7 @@ impl Inventory {
 
         let persistence_span = tracing::debug_span!("send_persistence_request", key = %key);
         if let Err(e) = persistence_span
-            .in_scope(|| async { self.persistence_tx.send(op).await })
+            .in_scope(|| async { persistence_tx.send(op).await })
             .await
         {
             tracing::error!("Failed to send persist operation: {}", e);
@@ -258,7 +292,15 @@ impl Inventory {
     pub async fn listen(&self) {
         tracing::info!("Starting inventory listener");
         tracing::debug!("Listening for inventory updates for ID: {}", self.id);
-        let mut receiver = self.broker.subscribe();
+
+        if self.broker.is_none() {
+            tracing::error!("Broker not set for inventory listener");
+            return;
+        }
+
+        let broker = self.broker.as_ref().unwrap().clone();
+        let mut receiver = broker.subscribe();
+
         let sender = self.broker.clone();
         let id = self.id;
         let status = self.status.clone();
@@ -312,11 +354,16 @@ impl Inventory {
                                     });
 
                                     tracing::info!("Resources reserved successfully with receipt: {}", receipt_id);
-                                    let _ = sender.send(InternalMessage::InventoryReserveResponse(Ok(receipt_id)));
+
+                                    if let Some(sender) = &sender {
+                                        let _ = sender.send(InternalMessage::InventoryReserveResponse(Ok(receipt_id)));
+                                    }
 
                                 } else {
                                     tracing::warn!("Insufficient resources for request: {:?}", request);
-                                    let _ = sender.send(InternalMessage::InventoryReserveResponse(Err("insufficient resources".to_string())));
+                                    if let Some(sender) = &sender {
+                                        let _ = sender.send(InternalMessage::InventoryReserveResponse(Err("insufficient resources".to_string())));
+                                    }
                                 }
                             }
                             Ok(InternalMessage::InventoryReleaseRequest(id)) => {
@@ -341,11 +388,15 @@ impl Inventory {
                                         }
                                         reserve_lock.remove(&id);
                                         tracing::info!("Resources released successfully for receipt: {}", id);
-                                        let _ = sender.send(InternalMessage::InventoryReleaseResponse(Ok(id)));
+                                        if let Some(sender) = &sender {
+                                            let _ = sender.send(InternalMessage::InventoryReleaseResponse(Ok(id)));
+                                        }
                                     }
                                     None => {
                                         tracing::warn!("No reservation found for ID: {}", id);
-                                        let _ = sender.send(InternalMessage::InventoryReleaseResponse(Err("no reservation found".to_string())));
+                                        if let Some(sender) = &sender {
+                                            let _ = sender.send(InternalMessage::InventoryReleaseResponse(Err("no reservation found".to_string())));
+                                        }
                                     }
                                 }
                             }
@@ -385,6 +436,7 @@ mod tests {
             Uuid::new_v4(),
             topic.clone().sender.clone(),
             &persistence_tx,
+            None,
         );
 
         fn wood() -> String {
@@ -443,6 +495,7 @@ mod tests {
             Uuid::new_v4(),
             topic.clone().sender.clone(),
             &persistence_tx,
+            None,
         );
 
         fn wood() -> String {
@@ -498,6 +551,7 @@ mod tests {
             Uuid::new_v4(),
             topic.clone().sender.clone(),
             &persistence_tx,
+            None,
         );
 
         inventory.listen().await;
@@ -524,6 +578,7 @@ mod tests {
             Uuid::new_v4(),
             topic.clone().sender.clone(),
             &persistence_tx,
+            None,
         );
 
         fn wood() -> String {
@@ -584,6 +639,7 @@ mod tests {
             Uuid::new_v4(),
             topic.clone().sender.clone(),
             &persistence_tx,
+            None,
         );
 
         inventory.listen().await;

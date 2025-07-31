@@ -148,7 +148,7 @@ impl PersistenceWorker {
                         opentelemetry::KeyValue::new("operation", "GET"),
                     ]);
 
-                    tracing::debug!("Processing GET operation for key: {}", key);
+                    tracing::info!("Processing GET operation for key: {key}");
 
                     let result = self.backend.get(Some(cx), key.clone());
                     if let Some(reply) = op.reply {
