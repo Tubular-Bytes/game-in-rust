@@ -48,8 +48,7 @@ async fn main() {
         .with_thread_ids(true)
         .with_file(true)
         .with_line_number(true)
-        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
-        .pretty();
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE);
 
     // Combine layers
     tracing_subscriber::registry()
@@ -57,10 +56,6 @@ async fn main() {
         .with(stdout_layer)
         .with(opentelemetry_layer)
         .init();
-
-    tracing::info!("Starting the application with enhanced tracing...");
-    tracing::info!("Tracing enabled for inventory and persistence modules");
-    tracing::info!("OTLP endpoint: http://localhost:4318/v1/traces (default)");
 
     let (store_tx, store_rx) = tokio::sync::mpsc::channel(100);
     let mut persistence = persistence::worker::PersistenceWorker::new(
@@ -133,6 +128,7 @@ async fn main() {
         .send(persistence::worker::Op {
             op_type: persistence::worker::OpType::Stop,
             reply: None,
+            span_context: None,
         })
         .await;
 
@@ -179,10 +175,10 @@ async fn main() {
     tracing::info!("Shutting down daemon...");
 
     // Give time for spans to be exported before shutdown
-    tracing::info!("Waiting for span export to complete...");
+    tracing::debug!("Waiting for span export to complete...");
     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
     // Shutdown OpenTelemetry to flush remaining spans
     opentelemetry::global::shutdown_tracer_provider();
-    tracing::info!("OpenTelemetry tracer shutdown complete.");
+    tracing::debug!("OpenTelemetry tracer shutdown complete.");
 }

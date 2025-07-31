@@ -1,6 +1,6 @@
 use opentelemetry::{
     KeyValue,
-    trace::{Span, Tracer, TracerProvider},
+    trace::{Span, Tracer},
 };
 use opentelemetry_sdk::{
     Resource,

@@ -1,3 +1,5 @@
+use std::vec;
+
 use building_game::{
     blueprint::model::Value,
     persistence::{
@@ -5,7 +7,10 @@ use building_game::{
         worker::{Op, OpType, PersistenceWorker, Persister},
     },
 };
-use opentelemetry::trace::TracerProvider;
+use opentelemetry::{
+    global,
+    trace::{Span, SpanContext, TraceContextExt, Tracer, TracerProvider}, Context,
+};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
@@ -49,8 +54,7 @@ async fn main() {
         .with_thread_ids(true)
         .with_file(true)
         .with_line_number(true)
-        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
-        .pretty();
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE);
 
     // Combine layers
     tracing_subscriber::registry()
@@ -68,22 +72,41 @@ async fn main() {
     let broker = building_game::actor::broker::Broker::new();
     let (store_tx, store_rx) = tokio::sync::mpsc::channel(100);
 
-    // Create example inventory data and store it in the database
-    tracing::info!("Creating example inventory data");
-    let existing_inventory = example_inventory_data(&store_tx);
+    let tracer = global::tracer("persistence-demo");
 
-    tracing::info!("Storing initial inventory data in persistence layer");
-    let initial_data_span =
-        tracing::info_span!("store_initial_data", inventory_id = %existing_inventory.id);
-    let _enter = initial_data_span.enter();
+    let mut span = tracer.start("persistence-demo.main");
+
+    let cx = span.span_context().clone();
+
+    tracing::info!(
+        "span.context.span_id" = cx.span_id().to_string(),
+        "span.context.trace_id" = cx.trace_id().to_string(),
+        "span.context.is_remote" = cx.is_remote().to_string(),
+        // "span.context.trace_flags" = cx.trace_flags(),
+        // "span.context.trace_state" = cx.trace_state().to_string(),
+        
+        "span context created"
+    );
+
+    // Create example inventory data and store it in the database
+    span.add_event("creating example inventory data", vec![]);
+    let existing_inventory = example_inventory_data(&cx, &store_tx);
+
+    span.set_attribute(opentelemetry::KeyValue::new(
+        "inventory.id",
+        existing_inventory.id.to_string(),
+    ));
+
+    span.add_event("store example data", vec![
+        opentelemetry::KeyValue::new("inventory.id", existing_inventory.id.to_string()),
+    ]);
 
     db.set(
+        Some(cx),
         format!("inventory:{}", existing_inventory.id.clone()),
         existing_inventory.serialize().unwrap(),
     )
     .unwrap();
-
-    drop(_enter); // Exit the span
 
     let mut persistence = PersistenceWorker::new(Box::new(db), store_rx);
 
@@ -92,12 +115,13 @@ async fn main() {
     });
 
     // Create a new inventory instance that will restore from persistence
-    tracing::info!(
-        "Creating inventory instance - this should trigger restoration from persistence"
+    span.add_event(
+        "creating new inventory instance",
+        vec![opentelemetry::KeyValue::new(
+            "inventory.id",
+            existing_inventory.id.to_string(),
+        )],
     );
-    let restoration_span =
-        tracing::info_span!("inventory_restoration_demo", inventory_id = %existing_inventory.id);
-    let _enter = restoration_span.enter();
 
     let _inventory = building_game::actor::inventory::Inventory::new(
         existing_inventory.id.clone(),
@@ -105,22 +129,26 @@ async fn main() {
         &store_tx.clone(),
     );
 
-    drop(_enter); // Exit the span
-
     // Give enough time for the inventory to restore its data
     tracing::info!("Waiting for inventory restoration to complete...");
     tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
     tracing::info!("Proceeding to shutdown...");
 
+    let context = span.span_context().clone();
+
     store_tx
         .send(Op {
             op_type: OpType::Stop,
             reply: None,
+            span_context: Some(context),
         })
         .await
         .unwrap();
 
     persistence_handle.await.unwrap();
+
+    // End the main span before shutdown
+    span.end();
 
     tracing::info!("Demo completed successfully!");
 
@@ -133,12 +161,28 @@ async fn main() {
     tracing::info!("OpenTelemetry tracer shutdown complete.");
 }
 
-#[tracing::instrument(skip(persistence_tx))]
 fn example_inventory_data(
+    cx: &SpanContext,
     persistence_tx: &tokio::sync::mpsc::Sender<building_game::persistence::worker::Op>,
 ) -> building_game::actor::inventory::Inventory {
+    let tracer = global::tracer("persistence-demo.example_inventory_data");
+    let context = Context::current().with_remote_span_context(cx.clone());
+    let mut span = tracer.start_with_context("persistence-demo.example", &context);
+
+    tracing::info!(
+        "span.context.span_id" = span.span_context().span_id().to_string(),
+        "span.context.trace_id" = span.span_context().trace_id().to_string(),
+        "span.context.is_remote" = span.span_context().is_remote().to_string(),
+        // "span.context.trace_flags" = span.span_context().trace_flags(),
+        // "span.context.trace_state" = span.span_context().trace_state().to_string(),
+        
+        "span context created"
+    );
+
     let id = Uuid::new_v4();
-    tracing::info!("Creating example inventory with ID: {}", id);
+    span.add_event("creating example inventory", vec![
+        opentelemetry::KeyValue::new("inventory.id", id.to_string()),
+    ]);
 
     let broker = building_game::actor::broker::Broker::new();
 
@@ -148,7 +192,11 @@ fn example_inventory_data(
         persistence_tx,
     );
 
-    tracing::debug!("Adding 100 wood to example inventory");
+    span.add_event("adding resource to inventory", vec![
+        opentelemetry::KeyValue::new("inventory.id", id.to_string()),
+        opentelemetry::KeyValue::new("resource.name", "wood".to_string()),
+        opentelemetry::KeyValue::new("resource.value", 100.to_string()),
+        ]);
     inv.resources.lock().unwrap().insert(
         "wood".to_string(),
         Value {
@@ -158,5 +206,9 @@ fn example_inventory_data(
     );
 
     tracing::info!("Example inventory data created successfully");
+    
+    // End the span before returning
+    span.end();
+    
     return inv;
 }

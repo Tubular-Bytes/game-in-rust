@@ -1,4 +1,4 @@
-use std::fmt::Display;
+use std::{error::Error, fmt::Display};
 
 #[derive(Debug)]
 pub struct MemoryDBError {
@@ -24,3 +24,5 @@ impl Display for MemoryDBError {
         write!(f, "MemoryDB Error: {}", self.reason)
     }
 }
+
+impl Error for MemoryDBError {}

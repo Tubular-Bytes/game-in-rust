@@ -4,6 +4,9 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use opentelemetry::{
+    global, trace::{Span, TraceContextExt, Tracer}, Context, KeyValue
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -38,7 +41,6 @@ pub struct Inventory {
 }
 
 impl Inventory {
-    #[tracing::instrument(skip(broker, persistence_tx))]
     pub fn new(
         id: Uuid,
         broker: tokio::sync::broadcast::Sender<InternalMessage>,
@@ -53,12 +55,18 @@ impl Inventory {
             persistence_tx: persistence_tx.clone(),
         };
 
+        let tracer = global::tracer("inventory_new");
+        let mut span = tracer.start("inventory.new");
+        span.set_attribute(KeyValue::new("inventory.id", inventory.id.to_string()));
+
+        let span_context = span.span_context().clone();
+
         // Spawn a blocking task to restore from persistence
         let inventory_for_restore = inventory.clone();
         tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Handle::current();
             rt.block_on(async {
-                match inventory_for_restore.restore().await {
+                match inventory_for_restore.restore(&span_context).await {
                     Ok(()) => {
                         tracing::info!(
                             "Successfully restored inventory {}",
@@ -80,7 +88,6 @@ impl Inventory {
         inventory
     }
 
-    #[tracing::instrument(skip(self), fields(inventory_id = %self.id))]
     pub fn serialize(&self) -> Result<String, serde_json::Error> {
         tracing::debug!("Serializing inventory");
         let inventory = SerializableInventory {
@@ -101,7 +108,6 @@ impl Inventory {
         self.id
     }
 
-    #[tracing::instrument(skip(self), fields(inventory_id = %self.id))]
     pub fn stop(&self) {
         tracing::info!("Stopping inventory");
         let mut status = self.status.lock().unwrap();
@@ -109,21 +115,25 @@ impl Inventory {
         tracing::debug!("Inventory status set to Stopping");
     }
 
-    #[tracing::instrument(skip(self), fields(inventory_id = %self.id))]
-    pub async fn restore(&self) -> Result<(), String> {
-        let restore_span = tracing::info_span!("inventory_restore", inventory_id = %self.id);
-        let _enter = restore_span.enter();
+    pub async fn restore(&self, ctx: &opentelemetry::trace::SpanContext) -> Result<(), String> {
+        let tracer = global::tracer("inventory_restore");
+
+        let cx = Context::current().with_remote_span_context(ctx.clone());
+        let mut restore_span = tracer.start_with_context("inventory.restore", &cx);
 
         tracing::info!("Starting inventory restore process");
         tracing::debug!("Attempting to restore inventory {id}", id = self.id);
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         let key = format!("inventory:{}", self.id);
-        tracing::debug!("Persistence key: {}", key);
+        restore_span.set_attribute(KeyValue::new("persistence.key", key.clone()));
+
+        let span_context = restore_span.span_context().clone();
 
         let op = worker::Op {
             op_type: worker::OpType::Get(key.clone()),
             reply: Some(reply_tx),
+            span_context: Some(span_context),
         };
 
         let persistence_span = tracing::debug_span!("send_persistence_request", key = %key);
@@ -195,7 +205,6 @@ impl Inventory {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self), fields(inventory_id = %self.id))]
     pub async fn persist(&self) -> Result<(), String> {
         let persist_span = tracing::info_span!("inventory_persist", inventory_id = %self.id);
         let _enter = persist_span.enter();
@@ -217,6 +226,7 @@ impl Inventory {
         let op = worker::Op {
             op_type: worker::OpType::Set(key.clone(), serialized),
             reply: Some(reply_tx),
+            span_context: None,
         };
 
         let persistence_span = tracing::debug_span!("send_persistence_request", key = %key);
@@ -245,7 +255,6 @@ impl Inventory {
         }
     }
 
-    #[tracing::instrument(skip(self), fields(inventory_id = %self.id))]
     pub async fn listen(&self) {
         tracing::info!("Starting inventory listener");
         tracing::debug!("Listening for inventory updates for ID: {}", self.id);

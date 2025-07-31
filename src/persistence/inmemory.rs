@@ -3,6 +3,8 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+use opentelemetry::{global, trace::{Span, Status, TraceContextExt, Tracer}, Context, KeyValue};
+
 use crate::persistence::{error::MemoryDBError, worker::Persister};
 
 type MemoryDB = Arc<RwLock<HashMap<String, String>>>;
@@ -27,55 +29,95 @@ impl Default for MemoryDatabase {
 }
 
 impl Persister for MemoryDatabase {
-    #[tracing::instrument(skip(self), fields(key = %key))]
-    fn set(&self, key: String, value: String) -> Result<(), MemoryDBError> {
-        tracing::debug!(
-            "Setting value in memory database, value_size: {}",
-            value.len()
+    fn set(
+        &self,
+        cx: Option<opentelemetry::trace::SpanContext>,
+        key: String,
+        value: String,
+    ) -> Result<(), MemoryDBError> {
+        let tracer = global::tracer("persistence.inmemory");
+        let parent_context = cx.unwrap_or_else(opentelemetry::trace::SpanContext::empty_context);
+        let context = Context::current().with_remote_span_context(parent_context.clone());
+        let mut span = tracer.start_with_context("persistence.inmemory.set", &context);
+
+        span.add_event(
+            "setting value in memory database",
+            vec![
+                KeyValue::new("key", key.clone()),
+                KeyValue::new("value.size", value.len() as i64)
+            ],
         );
         let mut db = self.db.write().map_err(|_| {
-            tracing::error!("Failed to acquire write lock for key: {}", key);
+            span.add_event("failed to acquire write lock for key", vec![KeyValue::new("key", key.clone())]);
+            span.set_status(Status::error("failed to acquire write lock"));
+            span.end();
             MemoryDBError::new("Failed to acquire write lock")
         })?;
         db.insert(key.clone(), value);
-        tracing::debug!("Successfully set value for key: {}", key);
+        span.set_status(Status::Ok);
+        span.end();
         Ok(())
     }
 
-    #[tracing::instrument(skip(self), fields(key = %key))]
-    fn delete(&self, key: String) -> Result<(), MemoryDBError> {
-        tracing::debug!("Deleting value from memory database");
+    fn delete(
+        &self,
+        cx: Option<opentelemetry::trace::SpanContext>,
+        key: String,
+    ) -> Result<(), MemoryDBError> {
+        let tracer = global::tracer("persistence.inmemory");
+        let parent_context = cx.unwrap_or_else(opentelemetry::trace::SpanContext::empty_context);
+        let context = Context::current().with_remote_span_context(parent_context.clone());
+        let mut span = tracer.start_with_context("persistence.inmemory.set", &context);
+
         let mut db = self.db.write().map_err(|_| {
-            tracing::error!("Failed to acquire write lock for key: {}", key);
+            span.add_event("failed to acquire write lock for key", vec![KeyValue::new("key", key.clone())]);
+            span.set_status(Status::error("failed to acquire write lock"));
+            span.end();
             MemoryDBError::new("Failed to acquire write lock")
         })?;
         let existed = db.remove(&key).is_some();
-        if existed {
-            tracing::debug!("Successfully deleted key: {}", key);
-        } else {
-            tracing::debug!("Key did not exist for deletion: {}", key);
-        }
+        span.set_attribute(KeyValue::new("key.deleted", existed));
+
+        span.set_status(Status::Ok);
+        span.end();
         Ok(())
     }
 
-    #[tracing::instrument(skip(self), fields(key = %key))]
-    fn get(&self, key: String) -> Result<String, MemoryDBError> {
-        tracing::debug!("Getting value from memory database");
+    fn get(
+        &self,
+        cx: Option<opentelemetry::trace::SpanContext>,
+        key: String,
+    ) -> Result<String, MemoryDBError> {
+        let tracer = global::tracer("persistence.inmemory");
+        let parent_context = cx.unwrap_or_else(opentelemetry::trace::SpanContext::empty_context);
+        let context = Context::current().with_remote_span_context(parent_context.clone());
+        let mut span = tracer.start_with_context("persistence.inmemory.set", &context);
+
         let db = self.db.read().map_err(|_| {
-            tracing::error!("Failed to acquire read lock for key: {}", key);
+            span.add_event("failed to acquire read lock for key", vec![KeyValue::new("key", key.clone())]);
+            span.set_status(Status::error("failed to acquire read lock"));
+            span.end();
             MemoryDBError::new("Failed to acquire read lock")
         })?;
         match db.get(&key) {
             Some(value) => {
-                tracing::debug!(
-                    "Successfully retrieved value for key: {}, value_size: {}",
-                    key,
-                    value.len()
+                span.add_event(
+                    "retrieved value from memory database",
+                    vec![
+                        KeyValue::new("key", key.clone()),
+                        KeyValue::new("value.size", value.len() as i64),
+                    ],
                 );
+                span.set_status(Status::Ok);
                 Ok(value.clone())
             }
             None => {
-                tracing::debug!("Key not found: {}", key);
+                span.add_event(
+                    "key not found in memory database",
+                    vec![KeyValue::new("key", key.clone())],
+                );
+                span.set_status(Status::error("key not found"));
+                span.end();
                 Err(MemoryDBError::new("Key not found"))
             }
         }

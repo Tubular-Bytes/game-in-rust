@@ -1,6 +1,11 @@
+use opentelemetry::{
+    Context, global,
+    trace::{Span, Status, TraceContextExt, Tracer},
+};
+
 use super::error::MemoryDBError;
 
-#[allow(dead_code)] // TODO remove once persistence is fully implemented
+#[derive(Debug)] // TODO remove once persistence is fully implemented
 pub enum OpType {
     Stop,
     Set(String, String),
@@ -11,6 +16,7 @@ pub enum OpType {
 pub struct Op {
     pub op_type: OpType,
     pub reply: Option<tokio::sync::oneshot::Sender<Result<String, MemoryDBError>>>,
+    pub span_context: Option<opentelemetry::trace::SpanContext>,
 }
 
 pub struct PersistenceWorker {
@@ -20,9 +26,22 @@ pub struct PersistenceWorker {
 }
 
 pub trait Persister {
-    fn set(&self, key: String, value: String) -> Result<(), MemoryDBError>;
-    fn delete(&self, key: String) -> Result<(), MemoryDBError>;
-    fn get(&self, key: String) -> Result<String, MemoryDBError>;
+    fn set(
+        &self,
+        ctx: Option<opentelemetry::trace::SpanContext>,
+        key: String,
+        value: String,
+    ) -> Result<(), MemoryDBError>;
+    fn delete(
+        &self,
+        ctx: Option<opentelemetry::trace::SpanContext>,
+        key: String,
+    ) -> Result<(), MemoryDBError>;
+    fn get(
+        &self,
+        ctx: Option<opentelemetry::trace::SpanContext>,
+        key: String,
+    ) -> Result<String, MemoryDBError>;
 }
 
 impl PersistenceWorker {
@@ -33,80 +52,130 @@ impl PersistenceWorker {
         Self { inbox, backend: db }
     }
 
-    #[tracing::instrument(skip(self))]
     pub async fn run(&mut self) {
         tracing::info!("Starting persistence worker");
         while let Some(op) = self.inbox.recv().await {
+            let span_context = op
+                .span_context
+                .clone()
+                .unwrap_or_else(opentelemetry::trace::SpanContext::empty_context);
+
+            let tracer = global::tracer("persistence_worker");
+
+            let context = Context::current().with_remote_span_context(span_context.clone());
+            let mut op_span = tracer.start_with_context("persistence.op", &context);
+
+            // let span_context = tracing::Span::current().context().with_span(op_span);
+            let cx = op_span.span_context().clone();
+
             match op.op_type {
                 OpType::Set(key, value) => {
-                    let set_span = tracing::info_span!("persistence_set",
-                        key = %key,
-                        value_size = value.len(),
-                        operation = "SET"
-                    );
-                    let _enter = set_span.enter();
+                    op_span.set_attributes(vec![
+                        opentelemetry::KeyValue::new("key", key.clone()),
+                        opentelemetry::KeyValue::new("value_size", value.len() as i64),
+                        opentelemetry::KeyValue::new("operation", "SET"),
+                    ]);
 
                     tracing::debug!("Processing SET operation for key: {}", key);
 
-                    let result = self.backend.set(key.clone(), value.clone());
+                    let result = self.backend.set(Some(cx), key.clone(), value.clone());
                     if let Some(reply) = op.reply {
                         match result {
                             Ok(_) => {
-                                tracing::info!("SET operation successful for key: {}", key);
+                                op_span.add_event(
+                                    "SET operation successful",
+                                    vec![
+                                        opentelemetry::KeyValue::new("key", key.clone()),
+                                        opentelemetry::KeyValue::new(
+                                            "value_length",
+                                            value.len() as i64,
+                                        ),
+                                    ],
+                                );
+                                op_span.set_status(Status::Ok);
                                 let _ = reply.send(Ok("Value set successfully".to_string()));
                             }
                             Err(e) => {
-                                tracing::error!("SET operation failed for key {}: {:?}", key, e);
+                                op_span.add_event(
+                                    "SET operation failed",
+                                    vec![
+                                        opentelemetry::KeyValue::new("key", key.clone()),
+                                        opentelemetry::KeyValue::new("error", format!("{e:?}")),
+                                    ],
+                                );
+                                op_span.set_status(Status::error(e.to_string()));
                                 let _ = reply.send(Err(e));
                             }
                         }
                     }
                 }
                 OpType::Delete(key) => {
-                    let delete_span = tracing::info_span!("persistence_delete",
-                        key = %key,
-                        operation = "DELETE"
-                    );
-                    let _enter = delete_span.enter();
+                    op_span.set_attributes(vec![
+                        opentelemetry::KeyValue::new("key", key.clone()),
+                        opentelemetry::KeyValue::new("operation", "DELETE"),
+                    ]);
 
                     tracing::debug!("Processing DELETE operation for key: {}", key);
 
-                    let result = self.backend.delete(key.clone());
+                    let result = self.backend.delete(Some(cx), key.clone());
                     if let Some(reply) = op.reply {
                         match result {
                             Ok(_) => {
-                                tracing::info!("DELETE operation successful for key: {}", key);
+                                op_span.add_event(
+                                    "DELETE operation successful",
+                                    vec![opentelemetry::KeyValue::new("key", key.clone())],
+                                );
+                                op_span.set_status(Status::Ok);
                                 let _ = reply.send(Ok("Value deleted successfully".to_string()));
                             }
                             Err(e) => {
-                                tracing::error!("DELETE operation failed for key {}: {:?}", key, e);
+                                op_span.add_event(
+                                    "DELETE operation failed",
+                                    vec![
+                                        opentelemetry::KeyValue::new("key", key.clone()),
+                                        opentelemetry::KeyValue::new("error", format!("{e:?}")),
+                                    ],
+                                );
+                                op_span.set_status(Status::error(e.to_string()));
                                 let _ = reply.send(Err(e));
                             }
                         }
                     }
                 }
                 OpType::Get(key) => {
-                    let get_span = tracing::info_span!("persistence_get",
-                        key = %key,
-                        operation = "GET"
-                    );
-                    let _enter = get_span.enter();
+                    op_span.set_attributes(vec![
+                        opentelemetry::KeyValue::new("key", key.clone()),
+                        opentelemetry::KeyValue::new("operation", "GET"),
+                    ]);
 
                     tracing::debug!("Processing GET operation for key: {}", key);
 
-                    let result = self.backend.get(key.clone());
+                    let result = self.backend.get(Some(cx), key.clone());
                     if let Some(reply) = op.reply {
                         match result {
                             Ok(value) => {
-                                tracing::info!(
-                                    "GET operation successful for key: {}, value length: {}",
-                                    key,
-                                    value.len()
+                                op_span.add_event(
+                                    "GET operation successful",
+                                    vec![
+                                        opentelemetry::KeyValue::new("key", key.clone()),
+                                        opentelemetry::KeyValue::new(
+                                            "value_length",
+                                            value.len() as i64,
+                                        ),
+                                    ],
                                 );
+                                op_span.set_status(Status::Ok);
                                 let _ = reply.send(Ok(value));
                             }
                             Err(e) => {
-                                tracing::error!("GET operation failed for key {}: {:?}", key, e);
+                                op_span.add_event(
+                                    "GET operation failed",
+                                    vec![
+                                        opentelemetry::KeyValue::new("key", key.clone()),
+                                        opentelemetry::KeyValue::new("error", format!("{e:?}")),
+                                    ],
+                                );
+                                op_span.set_status(Status::error(e.to_string()));
                                 let _ = reply.send(Err(e));
                             }
                         }
@@ -114,6 +183,7 @@ impl PersistenceWorker {
                 }
                 OpType::Stop => {
                     tracing::info!("Stopping PersistenceWorker - shutdown signal received");
+                    op_span.set_attributes(vec![opentelemetry::KeyValue::new("operation", "STOP")]);
                     if let Some(reply) = op.reply {
                         let _ = reply.send(Ok("Worker stopped".to_string()));
                     }
@@ -140,6 +210,7 @@ mod tests {
         tx.send(Op {
             op_type: OpType::Set("key1".to_string(), "value1".to_string()),
             reply: Some(reply_tx),
+            span_context: None,
         })
         .await
         .unwrap();
@@ -150,12 +221,16 @@ mod tests {
 
         assert!(reply_rx.await.is_ok());
 
-        assert_eq!(db.get("key1".to_string()).unwrap(), "value1".to_string());
+        assert_eq!(
+            db.get(None, "key1".to_string()).unwrap(),
+            "value1".to_string()
+        );
 
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
         tx.send(Op {
             op_type: OpType::Stop,
             reply: Some(stop_tx),
+            span_context: None,
         })
         .await
         .unwrap();
@@ -170,7 +245,10 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(32);
         let mut worker = PersistenceWorker::new(db.clone(), rx);
 
-        assert!(db.set("key1".to_string(), "value1".to_string()).is_ok());
+        assert!(
+            db.set(None, "key1".to_string(), "value1".to_string())
+                .is_ok()
+        );
 
         let handle = tokio::spawn(async move {
             worker.run().await;
@@ -180,18 +258,23 @@ mod tests {
         tx.send(Op {
             op_type: OpType::Set("key1".to_string(), "value2".to_string()),
             reply: Some(update_reply_tx),
+            span_context: None,
         })
         .await
         .unwrap();
 
         assert!(update_reply_rx.await.is_ok());
 
-        assert_eq!(db.get("key1".to_string()).unwrap(), "value2".to_string());
+        assert_eq!(
+            db.get(None, "key1".to_string()).unwrap(),
+            "value2".to_string()
+        );
 
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
         tx.send(Op {
             op_type: OpType::Stop,
             reply: Some(stop_tx),
+            span_context: None,
         })
         .await
         .unwrap();
@@ -206,7 +289,10 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(32);
         let mut worker = PersistenceWorker::new(db.clone(), rx);
 
-        assert!(db.set("key2".to_string(), "value2".to_string()).is_ok());
+        assert!(
+            db.set(None, "key2".to_string(), "value2".to_string())
+                .is_ok()
+        );
 
         let handle = tokio::spawn(async move {
             worker.run().await;
@@ -216,6 +302,7 @@ mod tests {
         tx.send(Op {
             op_type: OpType::Delete("key2".to_string()),
             reply: Some(delete_reply_tx),
+            span_context: None,
         })
         .await
         .unwrap();
@@ -223,7 +310,7 @@ mod tests {
         let reply = delete_reply_rx.await.unwrap();
         assert!(reply.is_ok());
         assert_eq!(
-            db.get("key2".to_string()),
+            db.get(None, "key2".to_string()),
             Err(MemoryDBError::new("Key not found"))
         );
 
@@ -231,6 +318,7 @@ mod tests {
         tx.send(Op {
             op_type: OpType::Stop,
             reply: Some(stop_tx),
+            span_context: None,
         })
         .await
         .unwrap();
@@ -245,7 +333,10 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(32);
         let mut worker = PersistenceWorker::new(db.clone(), rx);
 
-        assert!(db.set("key3".to_string(), "value3".to_string()).is_ok());
+        assert!(
+            db.set(None, "key3".to_string(), "value3".to_string())
+                .is_ok()
+        );
 
         let handle = tokio::spawn(async move {
             worker.run().await;
@@ -255,6 +346,7 @@ mod tests {
         tx.send(Op {
             op_type: OpType::Get("key3".to_string()),
             reply: Some(get_reply_tx),
+            span_context: None,
         })
         .await
         .unwrap();
@@ -266,6 +358,7 @@ mod tests {
         tx.send(Op {
             op_type: OpType::Stop,
             reply: Some(stop_tx),
+            span_context: None,
         })
         .await
         .unwrap();
@@ -288,6 +381,7 @@ mod tests {
         tx.send(Op {
             op_type: OpType::Get("nonexistent".to_string()),
             reply: Some(get_reply_tx),
+            span_context: None,
         })
         .await
         .unwrap();
@@ -299,6 +393,7 @@ mod tests {
         tx.send(Op {
             op_type: OpType::Stop,
             reply: Some(stop_tx),
+            span_context: None,
         })
         .await
         .unwrap();
