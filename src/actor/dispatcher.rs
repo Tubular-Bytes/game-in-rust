@@ -85,7 +85,24 @@ impl Dispatcher {
         // First, signal graceful stop to prevent new tasks from being processed
         let _ = self.broadcast(InternalMessage::GracefulStop);
 
-        // Wait for all tasks (active and pending) to complete with timeout
+        // Wait for all tasks to complete
+        self.wait_for_tasks_completion().await;
+
+        tracing::debug!("All tasks completed (or timed out), stopping workers...");
+
+        // Then send stop signal to terminate workers
+        let _ = self.broadcast(InternalMessage::Stop);
+
+        tracing::debug!("Sent stop signal to workers");
+
+        // Stop handles
+        self.stop_websocket_handle().await;
+        self.stop_worker_handles().await;
+
+        tracing::debug!("All tasks completed and workers stopped.");
+    }
+
+    async fn wait_for_tasks_completion(&self) {
         let start_time = tokio::time::Instant::now();
 
         loop {
@@ -103,15 +120,9 @@ impl Dispatcher {
 
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         }
+    }
 
-        tracing::debug!("All tasks completed (or timed out), stopping workers...");
-
-        // Then send stop signal to terminate workers
-        let _ = self.broadcast(InternalMessage::Stop);
-
-        tracing::debug!("Sent stop signal to workers");
-
-        // Stop the WebSocket task handle first
+    async fn stop_websocket_handle(&mut self) {
         if let Some(task_handle) = self.task_handle.take() {
             tracing::debug!("Waiting for WebSocket task handle to finish...");
 
@@ -125,7 +136,9 @@ impl Dispatcher {
                 }
             }
         }
+    }
 
+    async fn stop_worker_handles(&mut self) {
         // Wait for worker handles with timeout
         let worker_timeout = tokio::time::Duration::from_secs(5);
         let worker_start = tokio::time::Instant::now();
@@ -162,8 +175,6 @@ impl Dispatcher {
                 }
             }
         }
-
-        tracing::debug!("All tasks completed and workers stopped.");
     }
 
     pub async fn start(&mut self, workers: u8) {
@@ -195,42 +206,16 @@ impl Dispatcher {
         loop {
             tokio::select! {
                 message = self.ws_receiver.recv() => {
-                    match message {
-                        Some(message) => {
-                            match message.content {
-                                WebsocketMessage::TaskRequest(task_request) => {
-                                    let task_tx = task_tx.clone();
-                                    let queue = queue.clone();
-                                    let semaphore = message_semaphore.clone();
-                                    tokio::spawn(async move {
-                                        let _permit = semaphore.acquire().await.unwrap();
-                                        Self::handle_task_request(task_tx, task_request, &queue, message.reply).await;
-                                    });
-                                }
-                                WebsocketMessage::AddInventory(id) => {
-                                    let broker = broker.clone();
-                                    let inventories = inventories.clone();
-                                    let semaphore = message_semaphore.clone();
-                                    let persistence_sender = self.persistence_sender.clone();
-                                    tokio::spawn(async move {
-                                        let _permit = semaphore.acquire().await.unwrap();
-                                        Self::handle_add_inventory(id, &broker, &inventories, message.reply, persistence_sender).await;
-                                    });
-                                }
-                                WebsocketMessage::RemoveInventory(id) => {
-                                    let inventories = inventories.clone();
-                                    let semaphore = message_semaphore.clone();
-                                    tokio::spawn(async move {
-                                        let _permit = semaphore.acquire().await.unwrap();
-                                        Self::handle_remove_inventory(id, &inventories, message.reply).await;
-                                    });
-                                }
-                            }
-                        }
-                        None => {
-                            tracing::debug!("WebSocket receiver channel closed, stopping dispatcher");
-                            break;
-                        }
+                    if !Self::handle_websocket_message(
+                        message,
+                        &task_tx,
+                        &queue,
+                        &broker,
+                        &inventories,
+                        &message_semaphore,
+                        &self.persistence_sender,
+                    ).await {
+                        break;
                     }
                 }
                 _ = &mut shutdown_rx => {
@@ -274,6 +259,114 @@ impl Dispatcher {
                 0
             }
         }
+    }
+
+    async fn handle_websocket_message(
+        message: Option<Message>,
+        task_tx: &tokio::sync::broadcast::Sender<InternalMessage>,
+        queue: &Queue,
+        broker: &Broker,
+        inventories: &Arc<Mutex<HashMap<Uuid, Inventory>>>,
+        message_semaphore: &Arc<Semaphore>,
+        persistence_sender: &tokio::sync::mpsc::Sender<worker::Op>,
+    ) -> bool {
+        match message {
+            Some(message) => {
+                Self::process_message_content(
+                    message,
+                    task_tx,
+                    queue,
+                    broker,
+                    inventories,
+                    message_semaphore,
+                    persistence_sender,
+                ).await;
+                true
+            }
+            None => {
+                tracing::debug!("WebSocket receiver channel closed, stopping dispatcher");
+                false
+            }
+        }
+    }
+
+    async fn process_message_content(
+        message: Message,
+        task_tx: &tokio::sync::broadcast::Sender<InternalMessage>,
+        queue: &Queue,
+        broker: &Broker,
+        inventories: &Arc<Mutex<HashMap<Uuid, Inventory>>>,
+        message_semaphore: &Arc<Semaphore>,
+        persistence_sender: &tokio::sync::mpsc::Sender<worker::Op>,
+    ) {
+        match message.content {
+            WebsocketMessage::TaskRequest(task_request) => {
+                Self::spawn_task_request_handler(
+                    task_tx.clone(),
+                    task_request,
+                    queue.clone(),
+                    message_semaphore.clone(),
+                    message.reply,
+                ).await;
+            }
+            WebsocketMessage::AddInventory(id) => {
+                Self::spawn_add_inventory_handler(
+                    id,
+                    broker.clone(),
+                    inventories.clone(),
+                    message_semaphore.clone(),
+                    persistence_sender.clone(),
+                    message.reply,
+                ).await;
+            }
+            WebsocketMessage::RemoveInventory(id) => {
+                Self::spawn_remove_inventory_handler(
+                    id,
+                    inventories.clone(),
+                    message_semaphore.clone(),
+                    message.reply,
+                ).await;
+            }
+        }
+    }
+
+    async fn spawn_task_request_handler(
+        task_tx: tokio::sync::broadcast::Sender<InternalMessage>,
+        task_request: crate::actor::model::TaskRequest,
+        queue: Queue,
+        semaphore: Arc<Semaphore>,
+        reply: Option<tokio::sync::oneshot::Sender<Result<String, String>>>,
+    ) {
+        tokio::spawn(async move {
+            let _permit = semaphore.acquire().await.unwrap();
+            Self::handle_task_request(task_tx, task_request, &queue, reply).await;
+        });
+    }
+
+    async fn spawn_add_inventory_handler(
+        id: Uuid,
+        broker: Broker,
+        inventories: Arc<Mutex<HashMap<Uuid, Inventory>>>,
+        semaphore: Arc<Semaphore>,
+        persistence_sender: tokio::sync::mpsc::Sender<worker::Op>,
+        reply: Option<tokio::sync::oneshot::Sender<Result<String, String>>>,
+    ) {
+        tokio::spawn(async move {
+            let _permit = semaphore.acquire().await.unwrap();
+            Self::handle_add_inventory(id, &broker, &inventories, reply, persistence_sender).await;
+        });
+    }
+
+    async fn spawn_remove_inventory_handler(
+        id: Uuid,
+        inventories: Arc<Mutex<HashMap<Uuid, Inventory>>>,
+        semaphore: Arc<Semaphore>,
+        reply: Option<tokio::sync::oneshot::Sender<Result<String, String>>>,
+    ) {
+        tokio::spawn(async move {
+            let _permit = semaphore.acquire().await.unwrap();
+            Self::handle_remove_inventory(id, &inventories, reply).await;
+        });
     }
 
     pub fn total_task_count(&self) -> usize {
@@ -321,26 +414,43 @@ impl Dispatcher {
     ) {
         tracing::info!("Adding inventory with ID: {}", id);
 
+        let creation_result = Self::create_inventory_if_not_exists(
+            id, 
+            broker, 
+            inventories, 
+            &persistence_sender
+        ).await;
+
+        Self::handle_inventory_creation_result(creation_result, id, reply).await;
+    }
+
+    async fn create_inventory_if_not_exists(
+        id: Uuid,
+        broker: &Broker,
+        inventories: &Arc<Mutex<HashMap<Uuid, Inventory>>>,
+        persistence_sender: &tokio::sync::mpsc::Sender<worker::Op>,
+    ) -> Result<Option<Inventory>, String> {
         let inventories_clone = inventories.clone();
         let broker_clone = broker.clone();
+        let persistence_sender_clone = persistence_sender.clone();
 
-        let result = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             match inventories_clone.lock() {
                 Ok(mut inventories) => {
                     if let std::collections::hash_map::Entry::Vacant(e) = inventories.entry(id) {
                         let inventory = Inventory::new(
                             id,
                             broker_clone.topic(INVENTORY_TOPIC).sender.clone(),
-                            &persistence_sender,
+                            &persistence_sender_clone,
                             None,
                         );
                         let inventory_clone = inventory.clone();
                         e.insert(inventory);
                         tracing::debug!("New inventory created: {}", id);
-                        Ok((true, Some(inventory_clone))) // needs spawning
+                        Ok(Some(inventory_clone)) // needs spawning
                     } else {
                         tracing::debug!("Inventory already exists: {}", id);
-                        Ok((false, None)) // (needs_spawn, inventory)
+                        Ok(None) // doesn't need spawning
                     }
                 }
                 Err(e) => {
@@ -349,35 +459,39 @@ impl Dispatcher {
                 }
             }
         })
-        .await;
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("Create inventory handler panicked: {}", e);
+            Err("Internal error: handler failed".to_string())
+        })
+    }
 
-        // Handle the result and spawn inventory listener if needed
+    async fn handle_inventory_creation_result(
+        result: Result<Option<Inventory>, String>,
+        id: Uuid,
+        reply: Option<tokio::sync::oneshot::Sender<Result<String, String>>>,
+    ) {
         match result {
-            Ok(Ok((needs_spawn, inventory_opt))) => {
-                if needs_spawn {
-                    if let Some(inventory) = inventory_opt {
-                        tokio::spawn(async move { inventory.listen().await });
-                        tracing::debug!("New inventory added and listening: {}", id);
-                        if let Some(reply_sender) = reply {
-                            let _ =
-                                reply_sender.send(Ok("Inventory added and listening".to_string()));
-                        }
-                    }
-                } else if let Some(reply_sender) = reply {
-                    let _ = reply_sender.send(Ok("Inventory already exists".to_string()));
-                }
+            Ok(Some(inventory)) => {
+                tokio::spawn(async move { inventory.listen().await });
+                tracing::debug!("New inventory added and listening: {}", id);
+                Self::send_reply(reply, Ok("Inventory added and listening".to_string()));
             }
-            Ok(Err(e)) => {
-                if let Some(reply_sender) = reply {
-                    let _ = reply_sender.send(Err(e));
-                }
+            Ok(None) => {
+                Self::send_reply(reply, Ok("Inventory already exists".to_string()));
             }
             Err(e) => {
-                tracing::error!("Add inventory handler panicked: {}", e);
-                if let Some(reply_sender) = reply {
-                    let _ = reply_sender.send(Err("Internal error: handler failed".to_string()));
-                }
+                Self::send_reply(reply, Err(e));
             }
+        }
+    }
+
+    fn send_reply(
+        reply: Option<tokio::sync::oneshot::Sender<Result<String, String>>>,
+        result: Result<String, String>,
+    ) {
+        if let Some(reply_sender) = reply {
+            let _ = reply_sender.send(result);
         }
     }
 
@@ -388,6 +502,14 @@ impl Dispatcher {
     ) {
         tracing::debug!("Removing inventory with ID: {}", id);
 
+        let removal_result = Self::remove_inventory_and_stop(id, inventories).await;
+        Self::send_reply(reply, removal_result);
+    }
+
+    async fn remove_inventory_and_stop(
+        id: Uuid,
+        inventories: &Arc<Mutex<HashMap<Uuid, Inventory>>>,
+    ) -> Result<String, String> {
         let inventories_clone = inventories.clone();
 
         let result = tokio::task::spawn_blocking(move || {
@@ -415,21 +537,10 @@ impl Dispatcher {
         .await;
 
         match result {
-            Ok(Ok(msg)) => {
-                if let Some(reply_sender) = reply {
-                    let _ = reply_sender.send(Ok(msg));
-                }
-            }
-            Ok(Err(e)) => {
-                if let Some(reply_sender) = reply {
-                    let _ = reply_sender.send(Err(e));
-                }
-            }
+            Ok(result) => result,
             Err(e) => {
                 tracing::error!("Remove inventory handler panicked: {}", e);
-                if let Some(reply_sender) = reply {
-                    let _ = reply_sender.send(Err("Internal error: handler failed".to_string()));
-                }
+                Err("Internal error: handler failed".to_string())
             }
         }
     }
