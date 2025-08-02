@@ -25,7 +25,7 @@ pub struct PersistenceWorker {
     inbox: tokio::sync::mpsc::Receiver<Op>,
 }
 
-pub trait Persister {
+pub trait Persister: Send + Sync {
     fn set(
         &self,
         ctx: Option<opentelemetry::trace::SpanContext>,
@@ -61,137 +61,216 @@ impl PersistenceWorker {
                 .unwrap_or_else(opentelemetry::trace::SpanContext::empty_context);
 
             let tracer = global::tracer("persistence_worker");
-
             let context = Context::current().with_remote_span_context(span_context.clone());
             let mut op_span = tracer.start_with_context("persistence.op", &context);
-
-            // let span_context = tracing::Span::current().context().with_span(op_span);
             let cx = op_span.span_context().clone();
 
-            match op.op_type {
-                OpType::Set(key, value) => {
-                    op_span.set_attributes(vec![
-                        opentelemetry::KeyValue::new("key", key.clone()),
-                        opentelemetry::KeyValue::new("value_size", value.len() as i64),
-                        opentelemetry::KeyValue::new("operation", "SET"),
-                    ]);
-
-                    tracing::debug!("Processing SET operation for key: {}", key);
-
-                    let result = self.backend.set(Some(cx), key.clone(), value.clone());
-                    if let Some(reply) = op.reply {
-                        match result {
-                            Ok(_) => {
-                                op_span.add_event(
-                                    "SET operation successful",
-                                    vec![
-                                        opentelemetry::KeyValue::new("key", key.clone()),
-                                        opentelemetry::KeyValue::new(
-                                            "value_length",
-                                            value.len() as i64,
-                                        ),
-                                    ],
-                                );
-                                op_span.set_status(Status::Ok);
-                                let _ = reply.send(Ok("Value set successfully".to_string()));
-                            }
-                            Err(e) => {
-                                op_span.add_event(
-                                    "SET operation failed",
-                                    vec![
-                                        opentelemetry::KeyValue::new("key", key.clone()),
-                                        opentelemetry::KeyValue::new("error", format!("{e:?}")),
-                                    ],
-                                );
-                                op_span.set_status(Status::error(e.to_string()));
-                                let _ = reply.send(Err(e));
-                            }
-                        }
-                    }
-                }
-                OpType::Delete(key) => {
-                    op_span.set_attributes(vec![
-                        opentelemetry::KeyValue::new("key", key.clone()),
-                        opentelemetry::KeyValue::new("operation", "DELETE"),
-                    ]);
-
-                    tracing::debug!("Processing DELETE operation for key: {}", key);
-
-                    let result = self.backend.delete(Some(cx), key.clone());
-                    if let Some(reply) = op.reply {
-                        match result {
-                            Ok(_) => {
-                                op_span.add_event(
-                                    "DELETE operation successful",
-                                    vec![opentelemetry::KeyValue::new("key", key.clone())],
-                                );
-                                op_span.set_status(Status::Ok);
-                                let _ = reply.send(Ok("Value deleted successfully".to_string()));
-                            }
-                            Err(e) => {
-                                op_span.add_event(
-                                    "DELETE operation failed",
-                                    vec![
-                                        opentelemetry::KeyValue::new("key", key.clone()),
-                                        opentelemetry::KeyValue::new("error", format!("{e:?}")),
-                                    ],
-                                );
-                                op_span.set_status(Status::error(e.to_string()));
-                                let _ = reply.send(Err(e));
-                            }
-                        }
-                    }
-                }
-                OpType::Get(key) => {
-                    op_span.set_attributes(vec![
-                        opentelemetry::KeyValue::new("key", key.clone()),
-                        opentelemetry::KeyValue::new("operation", "GET"),
-                    ]);
-
-                    tracing::info!("Processing GET operation for key: {key}");
-
-                    let result = self.backend.get(Some(cx), key.clone());
-                    if let Some(reply) = op.reply {
-                        match result {
-                            Ok(value) => {
-                                op_span.add_event(
-                                    "GET operation successful",
-                                    vec![
-                                        opentelemetry::KeyValue::new("key", key.clone()),
-                                        opentelemetry::KeyValue::new(
-                                            "value_length",
-                                            value.len() as i64,
-                                        ),
-                                    ],
-                                );
-                                op_span.set_status(Status::Ok);
-                                let _ = reply.send(Ok(value));
-                            }
-                            Err(e) => {
-                                op_span.add_event(
-                                    "GET operation failed",
-                                    vec![
-                                        opentelemetry::KeyValue::new("key", key.clone()),
-                                        opentelemetry::KeyValue::new("error", format!("{e:?}")),
-                                    ],
-                                );
-                                op_span.set_status(Status::error(e.to_string()));
-                                let _ = reply.send(Err(e));
-                            }
-                        }
-                    }
-                }
-                OpType::Stop => {
-                    tracing::info!("Stopping PersistenceWorker - shutdown signal received");
-                    op_span.set_attributes(vec![opentelemetry::KeyValue::new("operation", "STOP")]);
-                    if let Some(reply) = op.reply {
-                        let _ = reply.send(Ok("Worker stopped".to_string()));
-                    }
-                    break;
-                }
+            let should_stop = self.process_operation(op, &mut op_span, cx).await;
+            if should_stop {
+                break;
             }
         }
         tracing::info!("Persistence worker shutdown complete");
+    }
+
+    async fn process_operation(
+        &self,
+        op: Op,
+        op_span: &mut opentelemetry::global::BoxedSpan,
+        cx: opentelemetry::trace::SpanContext,
+    ) -> bool {
+        match op.op_type {
+            OpType::Set(key, value) => {
+                self.handle_set_operation(key, value, op.reply, op_span, cx)
+                    .await;
+                false
+            }
+            OpType::Delete(key) => {
+                self.handle_delete_operation(key, op.reply, op_span, cx)
+                    .await;
+                false
+            }
+            OpType::Get(key) => {
+                self.handle_get_operation(key, op.reply, op_span, cx).await;
+                false
+            }
+            OpType::Stop => {
+                self.handle_stop_operation(op.reply, op_span).await;
+                true
+            }
+        }
+    }
+
+    async fn handle_set_operation(
+        &self,
+        key: String,
+        value: String,
+        reply: Option<tokio::sync::oneshot::Sender<Result<String, MemoryDBError>>>,
+        op_span: &mut opentelemetry::global::BoxedSpan,
+        cx: opentelemetry::trace::SpanContext,
+    ) {
+        op_span.set_attributes(vec![
+            opentelemetry::KeyValue::new("key", key.clone()),
+            opentelemetry::KeyValue::new("value_size", value.len() as i64),
+            opentelemetry::KeyValue::new("operation", "SET"),
+        ]);
+
+        tracing::debug!("Processing SET operation for key: {}", key);
+
+        let result = self.backend.set(Some(cx), key.clone(), value.clone());
+        self.send_set_response(result, key, value, reply, op_span)
+            .await;
+    }
+
+    async fn send_set_response(
+        &self,
+        result: Result<(), MemoryDBError>,
+        key: String,
+        value: String,
+        reply: Option<tokio::sync::oneshot::Sender<Result<String, MemoryDBError>>>,
+        op_span: &mut opentelemetry::global::BoxedSpan,
+    ) {
+        if let Some(reply) = reply {
+            match result {
+                Ok(_) => {
+                    op_span.add_event(
+                        "SET operation successful",
+                        vec![
+                            opentelemetry::KeyValue::new("key", key.clone()),
+                            opentelemetry::KeyValue::new("value_length", value.len() as i64),
+                        ],
+                    );
+                    op_span.set_status(Status::Ok);
+                    let _ = reply.send(Ok("Value set successfully".to_string()));
+                }
+                Err(e) => {
+                    op_span.add_event(
+                        "SET operation failed",
+                        vec![
+                            opentelemetry::KeyValue::new("key", key.clone()),
+                            opentelemetry::KeyValue::new("error", format!("{e:?}")),
+                        ],
+                    );
+                    op_span.set_status(Status::error(e.to_string()));
+                    let _ = reply.send(Err(e));
+                }
+            }
+        }
+    }
+
+    async fn handle_delete_operation(
+        &self,
+        key: String,
+        reply: Option<tokio::sync::oneshot::Sender<Result<String, MemoryDBError>>>,
+        op_span: &mut opentelemetry::global::BoxedSpan,
+        cx: opentelemetry::trace::SpanContext,
+    ) {
+        op_span.set_attributes(vec![
+            opentelemetry::KeyValue::new("key", key.clone()),
+            opentelemetry::KeyValue::new("operation", "DELETE"),
+        ]);
+
+        tracing::debug!("Processing DELETE operation for key: {}", key);
+
+        let result = self.backend.delete(Some(cx), key.clone());
+        self.send_delete_response(result, key, reply, op_span).await;
+    }
+
+    async fn send_delete_response(
+        &self,
+        result: Result<(), MemoryDBError>,
+        key: String,
+        reply: Option<tokio::sync::oneshot::Sender<Result<String, MemoryDBError>>>,
+        op_span: &mut opentelemetry::global::BoxedSpan,
+    ) {
+        if let Some(reply) = reply {
+            match result {
+                Ok(_) => {
+                    op_span.add_event(
+                        "DELETE operation successful",
+                        vec![opentelemetry::KeyValue::new("key", key.clone())],
+                    );
+                    op_span.set_status(Status::Ok);
+                    let _ = reply.send(Ok("Value deleted successfully".to_string()));
+                }
+                Err(e) => {
+                    op_span.add_event(
+                        "DELETE operation failed",
+                        vec![
+                            opentelemetry::KeyValue::new("key", key.clone()),
+                            opentelemetry::KeyValue::new("error", format!("{e:?}")),
+                        ],
+                    );
+                    op_span.set_status(Status::error(e.to_string()));
+                    let _ = reply.send(Err(e));
+                }
+            }
+        }
+    }
+
+    async fn handle_get_operation(
+        &self,
+        key: String,
+        reply: Option<tokio::sync::oneshot::Sender<Result<String, MemoryDBError>>>,
+        op_span: &mut opentelemetry::global::BoxedSpan,
+        cx: opentelemetry::trace::SpanContext,
+    ) {
+        op_span.set_attributes(vec![
+            opentelemetry::KeyValue::new("key", key.clone()),
+            opentelemetry::KeyValue::new("operation", "GET"),
+        ]);
+
+        tracing::info!("Processing GET operation for key: {key}");
+
+        let result = self.backend.get(Some(cx), key.clone());
+        self.send_get_response(result, key, reply, op_span).await;
+    }
+
+    async fn send_get_response(
+        &self,
+        result: Result<String, MemoryDBError>,
+        key: String,
+        reply: Option<tokio::sync::oneshot::Sender<Result<String, MemoryDBError>>>,
+        op_span: &mut opentelemetry::global::BoxedSpan,
+    ) {
+        if let Some(reply) = reply {
+            match result {
+                Ok(value) => {
+                    op_span.add_event(
+                        "GET operation successful",
+                        vec![
+                            opentelemetry::KeyValue::new("key", key.clone()),
+                            opentelemetry::KeyValue::new("value_length", value.len() as i64),
+                        ],
+                    );
+                    op_span.set_status(Status::Ok);
+                    let _ = reply.send(Ok(value));
+                }
+                Err(e) => {
+                    op_span.add_event(
+                        "GET operation failed",
+                        vec![
+                            opentelemetry::KeyValue::new("key", key.clone()),
+                            opentelemetry::KeyValue::new("error", format!("{e:?}")),
+                        ],
+                    );
+                    op_span.set_status(Status::error(e.to_string()));
+                    let _ = reply.send(Err(e));
+                }
+            }
+        }
+    }
+
+    async fn handle_stop_operation(
+        &self,
+        reply: Option<tokio::sync::oneshot::Sender<Result<String, MemoryDBError>>>,
+        op_span: &mut opentelemetry::global::BoxedSpan,
+    ) {
+        tracing::info!("Stopping PersistenceWorker - shutdown signal received");
+        op_span.set_attributes(vec![opentelemetry::KeyValue::new("operation", "STOP")]);
+        if let Some(reply) = reply {
+            let _ = reply.send(Ok("Worker stopped".to_string()));
+        }
     }
 }
 

@@ -10,6 +10,23 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
 async fn main() {
+    setup_tracing().await;
+
+    let (persistence_handle, store_tx) = start_persistence_worker().await;
+    let (dispatcher_handle, shutdown_tx, ws_tx) = start_dispatcher(&store_tx).await;
+
+    let listener = setup_tcp_listener().await;
+    let mut handles = JoinSet::new();
+
+    run_server_loop(listener, &ws_tx, &mut handles).await;
+
+    shutdown_services(shutdown_tx, dispatcher_handle, store_tx, persistence_handle).await;
+    shutdown_websocket_connections(handles).await;
+
+    finalize_shutdown().await;
+}
+
+async fn setup_tracing() {
     // Initialize OpenTelemetry tracer for Jaeger using OTLP
     let exporter = opentelemetry_otlp::new_exporter()
         .tonic()
@@ -56,7 +73,12 @@ async fn main() {
         .with(stdout_layer)
         .with(opentelemetry_layer)
         .init();
+}
 
+async fn start_persistence_worker() -> (
+    tokio::task::JoinHandle<()>,
+    tokio::sync::mpsc::Sender<persistence::worker::Op>,
+) {
     let (store_tx, store_rx) = tokio::sync::mpsc::channel(100);
     let mut persistence = persistence::worker::PersistenceWorker::new(
         Box::new(persistence::inmemory::MemoryDatabase::new()),
@@ -67,10 +89,19 @@ async fn main() {
         persistence.run().await;
     });
 
+    (persistence_handle, store_tx)
+}
+
+async fn start_dispatcher(
+    store_tx: &tokio::sync::mpsc::Sender<persistence::worker::Op>,
+) -> (
+    tokio::task::JoinHandle<()>,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::mpsc::Sender<building_game::actor::model::Message>,
+) {
     let broker = broker::Broker::new();
     let (ws_tx, ws_rx) = tokio::sync::mpsc::channel(100);
-    let mut dispatcher = dispatcher::Dispatcher::new(&broker, ws_rx, &store_tx);
-    let broker_tx = dispatcher.topic().clone();
+    let mut dispatcher = dispatcher::Dispatcher::new(&broker, ws_rx, store_tx);
 
     // Create a shutdown signal channel
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
@@ -79,6 +110,10 @@ async fn main() {
         dispatcher.start_with_shutdown(2, shutdown_rx).await;
     });
 
+    (dispatcher_handle, shutdown_tx, ws_tx)
+}
+
+async fn setup_tcp_listener() -> tokio::net::TcpListener {
     let addr = env::args()
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:9100".to_string());
@@ -88,14 +123,19 @@ async fn main() {
         Ok(socket) => socket,
         Err(e) => {
             tracing::error!("Failed to bind to address {}: {}", addr, e);
-            return;
+            std::process::exit(1);
         }
     };
 
     tracing::info!("Listening for TCP connections on {}", addr);
+    listener
+}
 
-    let mut handles = JoinSet::new();
-
+async fn run_server_loop(
+    listener: tokio::net::TcpListener,
+    ws_tx: &tokio::sync::mpsc::Sender<building_game::actor::model::Message>,
+    handles: &mut JoinSet<()>,
+) {
     loop {
         tokio::select! {
             Ok((stream, _)) = listener.accept() => {
@@ -111,7 +151,14 @@ async fn main() {
 
     // Stop accepting new connections
     drop(listener);
+}
 
+async fn shutdown_services(
+    shutdown_tx: tokio::sync::oneshot::Sender<()>,
+    dispatcher_handle: tokio::task::JoinHandle<()>,
+    store_tx: tokio::sync::mpsc::Sender<persistence::worker::Op>,
+    persistence_handle: tokio::task::JoinHandle<()>,
+) {
     // Signal the dispatcher to stop gracefully
     tracing::debug!("Signaling dispatcher to stop...");
     let _ = shutdown_tx.send(());
@@ -123,7 +170,8 @@ async fn main() {
         Err(_) => tracing::warn!("Dispatcher shutdown timed out."),
     }
 
-    tracing::debug!("Signaling dispatcher to stop...");
+    // Stop persistence worker
+    tracing::debug!("Signaling persistence worker to stop...");
     let _ = store_tx
         .send(persistence::worker::Op {
             op_type: persistence::worker::OpType::Stop,
@@ -137,12 +185,9 @@ async fn main() {
         Ok(_) => tracing::debug!("Persister stopped successfully."),
         Err(_) => tracing::warn!("Persister shutdown timed out."),
     }
+}
 
-    // Close the broadcast channel to signal no more tasks
-    drop(broker_tx);
-    drop(ws_tx);
-    tracing::debug!("Broadcast channel closed.");
-
+async fn shutdown_websocket_connections(mut handles: JoinSet<()>) {
     // Wait for all WebSocket connections to close (with timeout)
     tracing::debug!("Waiting for all WebSocket connections to close...");
 
@@ -172,6 +217,9 @@ async fn main() {
     }
 
     tracing::debug!("All workers have been stopped.");
+}
+
+async fn finalize_shutdown() {
     tracing::info!("Shutting down daemon...");
 
     // Give time for spans to be exported before shutdown

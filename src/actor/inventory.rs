@@ -343,100 +343,20 @@ impl Inventory {
             loop {
                 if *status.lock().unwrap() == Status::Stopping {
                     tracing::debug!("Stopping inventory listener for ID: {}", id);
-                    break; // Exit the loop if stopping
+                    break;
                 }
+
                 tokio::select! {
                     msg = receiver.recv() => {
-                        match msg {
-                            Ok(InternalMessage::InventoryReserveRequest(request)) => {
-                                let reserve_span = tracing::info_span!(
-                                    "inventory_reserve_request",
-                                    inventory_id = %id,
-                                    resource_count = request.len()
-                                );
-                                let _enter = reserve_span.enter();
-
-                                tracing::debug!("Received inventory reserve request: {:?}", request);
-                                tracing::debug!("resources: {:?} | reserved: {:?}", resources, reserved);
-
-                                let mut resource_lock = resources.lock().unwrap();
-                                if request.iter().all(|(name, value)| {
-                                    resource_lock
-                                        .get(name)
-                                        .is_some_and(|res| res.value >= value.value)
-                                }) {
-                                    tracing::debug!("Found sufficient resources, reserving");
-                                    let mut reserve_lock = reserved.lock().unwrap();
-
-                                    for (name, value) in request.clone() {
-                                        resource_lock.entry(name.clone()).and_modify(|res| {
-                                            res.value -= value.value;
-                                        });
-                                    }
-
-                                    let receipt_id = Uuid::new_v4();
-
-                                    reserve_lock.insert(receipt_id, Receipt {
-                                        id: receipt_id,
-                                        resources: request.clone(),
-                                    });
-
-                                    tracing::info!("Resources reserved successfully with receipt: {}", receipt_id);
-
-                                    if let Some(sender) = &sender {
-                                        let _ = sender.send(InternalMessage::InventoryReserveResponse(Ok(receipt_id)));
-                                    }
-
-                                } else {
-                                    tracing::warn!("Insufficient resources for request: {:?}", request);
-                                    if let Some(sender) = &sender {
-                                        let _ = sender.send(InternalMessage::InventoryReserveResponse(Err("insufficient resources".to_string())));
-                                    }
-                                }
-                            }
-                            Ok(InternalMessage::InventoryReleaseRequest(id)) => {
-                                let release_span = tracing::info_span!(
-                                    "inventory_release_request",
-                                    inventory_id = %id,
-                                    receipt_id = %id
-                                );
-                                let _enter = release_span.enter();
-
-                                tracing::debug!("Received inventory release request: {:?}", id);
-                                let mut resource_lock = resources.lock().unwrap();
-                                let mut reserve_lock = reserved.lock().unwrap();
-
-                                match reserve_lock.get(&id) {
-                                    Some(receipt) => {
-                                        tracing::debug!("Found receipt for release: {:?}", receipt);
-                                        for (name, value) in &receipt.resources {
-                                            resource_lock.entry(name.clone()).and_modify(|res| {
-                                                res.value += value.value;
-                                            });
-                                        }
-                                        reserve_lock.remove(&id);
-                                        tracing::info!("Resources released successfully for receipt: {}", id);
-                                        if let Some(sender) = &sender {
-                                            let _ = sender.send(InternalMessage::InventoryReleaseResponse(Ok(id)));
-                                        }
-                                    }
-                                    None => {
-                                        tracing::warn!("No reservation found for ID: {}", id);
-                                        if let Some(sender) = &sender {
-                                            let _ = sender.send(InternalMessage::InventoryReleaseResponse(Err("no reservation found".to_string())));
-                                        }
-                                    }
-                                }
-                            }
-                            Ok(InternalMessage::Stop) => {
-                                tracing::warn!("Stopping inventory listener for ID: {}", id);
-                                break; // Exit the loop on stop signal
-                            }
-                            Err(e) => {
-                                tracing::error!("Error receiving message: {}", e);
-                                break; // Exit the loop on error
-                            }
-                            _ => {}
+                        let should_stop = Self::handle_inventory_message(
+                            msg,
+                            id,
+                            &resources,
+                            &reserved,
+                            &sender
+                        ).await;
+                        if should_stop {
+                            break;
                         }
                     }
                 }
@@ -445,6 +365,202 @@ impl Inventory {
             tracing::debug!("Inventory listener stopped");
             *status.lock().unwrap() = Status::Stopped;
         });
+    }
+
+    async fn handle_inventory_message(
+        msg: Result<InternalMessage, tokio::sync::broadcast::error::RecvError>,
+        id: Uuid,
+        resources: &Arc<Mutex<HashMap<String, Value<u64>>>>,
+        reserved: &Arc<Mutex<HashMap<Uuid, Receipt>>>,
+        sender: &Option<tokio::sync::broadcast::Sender<InternalMessage>>,
+    ) -> bool {
+        match msg {
+            Ok(message) => {
+                Self::process_internal_message(message, id, resources, reserved, sender).await
+            }
+            Err(e) => {
+                tracing::error!("Error receiving message: {}", e);
+                true // Stop on error
+            }
+        }
+    }
+
+    async fn process_internal_message(
+        message: InternalMessage,
+        id: Uuid,
+        resources: &Arc<Mutex<HashMap<String, Value<u64>>>>,
+        reserved: &Arc<Mutex<HashMap<Uuid, Receipt>>>,
+        sender: &Option<tokio::sync::broadcast::Sender<InternalMessage>>,
+    ) -> bool {
+        match message {
+            InternalMessage::InventoryReserveRequest(request) => {
+                Self::handle_reserve_request(request, id, resources, reserved, sender).await;
+                false
+            }
+            InternalMessage::InventoryReleaseRequest(receipt_id) => {
+                Self::handle_release_request(receipt_id, id, resources, reserved, sender).await;
+                false
+            }
+            InternalMessage::Stop => {
+                tracing::warn!("Stopping inventory listener for ID: {}", id);
+                true // Stop
+            }
+            _ => false, // Continue for other messages
+        }
+    }
+
+    async fn handle_reserve_request(
+        request: HashMap<String, Value<u64>>,
+        id: Uuid,
+        resources: &Arc<Mutex<HashMap<String, Value<u64>>>>,
+        reserved: &Arc<Mutex<HashMap<Uuid, Receipt>>>,
+        sender: &Option<tokio::sync::broadcast::Sender<InternalMessage>>,
+    ) {
+        let reserve_span = tracing::info_span!(
+            "inventory_reserve_request",
+            inventory_id = %id,
+            resource_count = request.len()
+        );
+        let _enter = reserve_span.enter();
+
+        tracing::debug!("Received inventory reserve request: {:?}", request);
+        tracing::debug!("resources: {:?} | reserved: {:?}", resources, reserved);
+
+        let has_resources = {
+            let resource_lock = resources.lock().unwrap();
+            Self::has_sufficient_resources(&request, &resource_lock)
+        };
+
+        if has_resources {
+            Self::process_reservation(request, resources, reserved, sender).await;
+        } else {
+            Self::handle_insufficient_resources(request, sender).await;
+        }
+    }
+
+    fn has_sufficient_resources(
+        request: &HashMap<String, Value<u64>>,
+        resource_lock: &HashMap<String, Value<u64>>,
+    ) -> bool {
+        request.iter().all(|(name, value)| {
+            resource_lock
+                .get(name)
+                .is_some_and(|res| res.value >= value.value)
+        })
+    }
+
+    async fn process_reservation(
+        request: HashMap<String, Value<u64>>,
+        resources: &Arc<Mutex<HashMap<String, Value<u64>>>>,
+        reserved: &Arc<Mutex<HashMap<Uuid, Receipt>>>,
+        sender: &Option<tokio::sync::broadcast::Sender<InternalMessage>>,
+    ) {
+        tracing::debug!("Found sufficient resources, reserving");
+        let mut resource_lock = resources.lock().unwrap();
+        let mut reserve_lock = reserved.lock().unwrap();
+
+        for (name, value) in request.clone() {
+            resource_lock.entry(name.clone()).and_modify(|res| {
+                res.value -= value.value;
+            });
+        }
+
+        let receipt_id = Uuid::new_v4();
+        reserve_lock.insert(
+            receipt_id,
+            Receipt {
+                id: receipt_id,
+                resources: request.clone(),
+            },
+        );
+
+        tracing::info!(
+            "Resources reserved successfully with receipt: {}",
+            receipt_id
+        );
+
+        if let Some(sender) = sender {
+            let _ = sender.send(InternalMessage::InventoryReserveResponse(Ok(receipt_id)));
+        }
+    }
+
+    async fn handle_insufficient_resources(
+        request: HashMap<String, Value<u64>>,
+        sender: &Option<tokio::sync::broadcast::Sender<InternalMessage>>,
+    ) {
+        tracing::warn!("Insufficient resources for request: {:?}", request);
+        if let Some(sender) = sender {
+            let _ = sender.send(InternalMessage::InventoryReserveResponse(Err(
+                "insufficient resources".to_string(),
+            )));
+        }
+    }
+
+    async fn handle_release_request(
+        receipt_id: Uuid,
+        id: Uuid,
+        resources: &Arc<Mutex<HashMap<String, Value<u64>>>>,
+        reserved: &Arc<Mutex<HashMap<Uuid, Receipt>>>,
+        sender: &Option<tokio::sync::broadcast::Sender<InternalMessage>>,
+    ) {
+        let release_span = tracing::info_span!(
+            "inventory_release_request",
+            inventory_id = %id,
+            receipt_id = %receipt_id
+        );
+        let _enter = release_span.enter();
+
+        tracing::debug!("Received inventory release request: {:?}", receipt_id);
+
+        let receipt_opt = {
+            let reserve_lock = reserved.lock().unwrap();
+            reserve_lock.get(&receipt_id).cloned()
+        };
+
+        if let Some(receipt) = receipt_opt {
+            Self::process_release(&receipt, resources, reserved, receipt_id, sender).await;
+        } else {
+            Self::handle_release_not_found(receipt_id, sender).await;
+        }
+    }
+
+    async fn process_release(
+        receipt: &Receipt,
+        resources: &Arc<Mutex<HashMap<String, Value<u64>>>>,
+        reserved: &Arc<Mutex<HashMap<Uuid, Receipt>>>,
+        receipt_id: Uuid,
+        sender: &Option<tokio::sync::broadcast::Sender<InternalMessage>>,
+    ) {
+        tracing::debug!("Found receipt for release: {:?}", receipt);
+
+        let mut resource_lock = resources.lock().unwrap();
+        let mut reserve_lock = reserved.lock().unwrap();
+
+        for (name, value) in &receipt.resources {
+            resource_lock.entry(name.clone()).and_modify(|res| {
+                res.value += value.value;
+            });
+        }
+        reserve_lock.remove(&receipt_id);
+        tracing::info!(
+            "Resources released successfully for receipt: {}",
+            receipt_id
+        );
+        if let Some(sender) = sender {
+            let _ = sender.send(InternalMessage::InventoryReleaseResponse(Ok(receipt_id)));
+        }
+    }
+
+    async fn handle_release_not_found(
+        receipt_id: Uuid,
+        sender: &Option<tokio::sync::broadcast::Sender<InternalMessage>>,
+    ) {
+        tracing::warn!("No reservation found for ID: {}", receipt_id);
+        if let Some(sender) = sender {
+            let _ = sender.send(InternalMessage::InventoryReleaseResponse(Err(
+                "no reservation found".to_string(),
+            )));
+        }
     }
 }
 
