@@ -13,7 +13,11 @@ tokio = { version = "1.46.1", features = ["full"] }
 tokio-tungstenite = { version = "0.27.0", features = ["handshake"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["fmt", "env-filter", "json"] }
-uuid = { version = "1.17.0", features = ["v4"] }
+tracing-opentelemetry = "0.24.0"
+opentelemetry = "0.23.0"
+opentelemetry_sdk = { version = "0.23.0", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.16.0", features = ["http-proto", "reqwest-client", "grpc-tonic"] }
+uuid = { version = "1.17.0", features = ["v4", "serde"] }
 
 [profile.release]
 strip = "debuginfo"

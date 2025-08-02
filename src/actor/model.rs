@@ -12,9 +12,9 @@ pub type Queue = Arc<Mutex<VecDeque<Task>>>;
 
 #[derive(Clone, Debug)]
 pub enum TaskKind {
-    Build,
-    Produce,
-    Train,
+    Build(String),
+    Produce(String),
+    Train(String),
 }
 
 #[derive(Clone, Debug)]
@@ -38,7 +38,6 @@ impl Display for ResponseSignal {
 pub struct TaskRequest<T = TaskKind> {
     pub owner: Uuid,
     pub request_id: String,
-    pub item: String,
     pub kind: T,
     pub respond_to: tokio::sync::mpsc::Sender<ResponseSignal>,
 }
@@ -57,6 +56,10 @@ pub enum InternalMessage {
     InventoryReserveResponse(Result<Uuid, String>),
     InventoryReleaseRequest(Uuid),
     InventoryReleaseResponse(Result<Uuid, String>),
+    InventoryRestoreRequest(Uuid),
+    InventoryRestoreResponse(Result<Uuid, String>),
+    InventoryPersistRequest(Uuid),
+    InventoryPersistResponse(Result<Uuid, String>),
     TaskAdded,
     Stop,
     GracefulStop,
@@ -68,6 +71,7 @@ pub enum WebsocketMessage {
     RemoveInventory(Uuid),
 }
 
+#[derive(Debug)]
 pub struct Message<T = WebsocketMessage> {
     pub id: Uuid,
     pub content: T,

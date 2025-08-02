@@ -53,6 +53,10 @@ impl Broker {
             .clone()
     }
 
+    pub fn topics(&self) -> Vec<String> {
+        self.topics.lock().unwrap().keys().cloned().collect()
+    }
+
     pub fn subscribe(&self, name: &str) -> tokio::sync::broadcast::Receiver<InternalMessage> {
         self.topic(name).subscribe()
     }
