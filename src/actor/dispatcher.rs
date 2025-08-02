@@ -280,7 +280,8 @@ impl Dispatcher {
                     inventories,
                     message_semaphore,
                     persistence_sender,
-                ).await;
+                )
+                .await;
                 true
             }
             None => {
@@ -307,7 +308,8 @@ impl Dispatcher {
                     queue.clone(),
                     message_semaphore.clone(),
                     message.reply,
-                ).await;
+                )
+                .await;
             }
             WebsocketMessage::AddInventory(id) => {
                 Self::spawn_add_inventory_handler(
@@ -317,7 +319,8 @@ impl Dispatcher {
                     message_semaphore.clone(),
                     persistence_sender.clone(),
                     message.reply,
-                ).await;
+                )
+                .await;
             }
             WebsocketMessage::RemoveInventory(id) => {
                 Self::spawn_remove_inventory_handler(
@@ -325,7 +328,8 @@ impl Dispatcher {
                     inventories.clone(),
                     message_semaphore.clone(),
                     message.reply,
-                ).await;
+                )
+                .await;
             }
         }
     }
@@ -414,12 +418,9 @@ impl Dispatcher {
     ) {
         tracing::info!("Adding inventory with ID: {}", id);
 
-        let creation_result = Self::create_inventory_if_not_exists(
-            id, 
-            broker, 
-            inventories, 
-            &persistence_sender
-        ).await;
+        let creation_result =
+            Self::create_inventory_if_not_exists(id, broker, inventories, &persistence_sender)
+                .await;
 
         Self::handle_inventory_creation_result(creation_result, id, reply).await;
     }
