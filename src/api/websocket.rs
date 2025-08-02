@@ -103,8 +103,7 @@ pub async fn accept_connection(
                     actor::model::TaskRequest {
                         owner: id,
                         request_id: mmsg.id.clone(),
-                        item: mmsg.params.blueprint.clone(),
-                        kind: actor::model::TaskKind::Build, // Default kind, can be modified as needed
+                        kind: actor::model::TaskKind::Build(mmsg.params.blueprint.clone()), // Default kind, can be modified as needed
                         respond_to: response_tx.clone(),
                     },
                 ));

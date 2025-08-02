@@ -150,7 +150,7 @@ mod tests {
         let task = Task {
             id: Uuid::new_v4(),
             request_id: "test_request".to_string(),
-            kind: TaskKind::Build,
+            kind: TaskKind::Build("test_item".to_string()),
             respond_to: tx,
         };
 

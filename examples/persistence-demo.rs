@@ -153,16 +153,29 @@ async fn main() {
     );
 
     if let Err(e) = persist_inventory(&existing_inventory, &store_tx).await {
-        tracing::error!("Failed to persist inventory: {}", existing_inventory.id.to_string());
-        span.add_event("failed to persist inventory", vec![
-            opentelemetry::KeyValue::new("error", e.to_string()),
-            opentelemetry::KeyValue::new("inventory.id", existing_inventory.id.to_string()),
-        ]);
+        tracing::error!(
+            "Failed to persist inventory: {}",
+            existing_inventory.id.to_string()
+        );
+        span.add_event(
+            "failed to persist inventory",
+            vec![
+                opentelemetry::KeyValue::new("error", e.to_string()),
+                opentelemetry::KeyValue::new("inventory.id", existing_inventory.id.to_string()),
+            ],
+        );
     } else {
-        tracing::info!("inventory persisted successfully: {}", existing_inventory.id.to_string());
-        span.add_event("inventory persisted", vec![
-            opentelemetry::KeyValue::new("inventory.id", existing_inventory.id.to_string()),
-        ]);
+        tracing::info!(
+            "inventory persisted successfully: {}",
+            existing_inventory.id.to_string()
+        );
+        span.add_event(
+            "inventory persisted",
+            vec![opentelemetry::KeyValue::new(
+                "inventory.id",
+                existing_inventory.id.to_string(),
+            )],
+        );
     }
 
     // Give enough time for the inventory to restore its data
@@ -294,7 +307,10 @@ fn fake_inventory_data(cx: &SpanContext) -> building_game::actor::inventory::Inv
     return inv;
 }
 
-async fn persist_inventory(inventory: &building_game::actor::inventory::Inventory, tx: &tokio::sync::mpsc::Sender<building_game::persistence::worker::Op>) -> Result<(), SendError<building_game::persistence::worker::Op>> {
+async fn persist_inventory(
+    inventory: &building_game::actor::inventory::Inventory,
+    tx: &tokio::sync::mpsc::Sender<building_game::persistence::worker::Op>,
+) -> Result<(), SendError<building_game::persistence::worker::Op>> {
     let key = format!("inventory:{}", inventory.id);
     let value = inventory.serialize().unwrap();
 
@@ -302,7 +318,8 @@ async fn persist_inventory(inventory: &building_game::actor::inventory::Inventor
         op_type: building_game::persistence::worker::OpType::Set(key, value),
         reply: None,
         span_context: None,
-    }).await?;
+    })
+    .await?;
 
     Ok(())
 }

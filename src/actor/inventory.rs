@@ -123,15 +123,43 @@ impl Inventory {
         result
     }
 
-    pub fn id(&self) -> Uuid {
-        self.id
-    }
-
-    pub fn stop(&self) {
+    pub async fn stop(&self) {
         tracing::info!("Stopping inventory");
-        let mut status = self.status.lock().unwrap();
-        *status = Status::Stopping;
+        {
+            let mut status = self.status.lock().unwrap();
+            *status = Status::Stopping;
+        }
         tracing::debug!("Inventory status set to Stopping");
+        println!("Inventory {} is stopping", self.id);
+
+        let mut i = 0;
+        loop {
+            let status = {
+                let status = self.status.lock().unwrap();
+
+                status.clone()
+            };
+
+            if status == Status::Stopped {
+                tracing::info!("Inventory {} stopped successfully", self.id);
+                break;
+            }
+            if i >= 4 {
+                tracing::warn!("Inventory {} did not stop in time, force stopping", self.id);
+                {
+                    let mut status = self.status.lock().unwrap();
+                    *status = Status::Stopped;
+                }
+                break;
+            }
+
+            i += 1;
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
+
+        if let Err(e) = self.persist().await {
+            tracing::error!("Failed to persist inventory {}: {}", self.id, e);
+        }
     }
 
     pub async fn restore(&self, ctx: &opentelemetry::trace::SpanContext) -> Result<(), String> {
@@ -401,7 +429,7 @@ impl Inventory {
                                 }
                             }
                             Ok(InternalMessage::Stop) => {
-                                tracing::debug!("Stopping inventory listener for ID: {}", id);
+                                tracing::warn!("Stopping inventory listener for ID: {}", id);
                                 break; // Exit the loop on stop signal
                             }
                             Err(e) => {
@@ -649,7 +677,7 @@ mod tests {
             assert_eq!(*status, Status::Listening);
         }
 
-        inventory.stop();
+        inventory.stop().await;
 
         // Wait a moment to ensure the listener has stopped
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;

@@ -69,11 +69,21 @@ impl Dispatcher {
         self.broker.topic(TASK_TOPIC).publish(msg)
     }
 
+    pub fn broadcast(
+        &self,
+        msg: InternalMessage,
+    ) -> Result<(), tokio::sync::broadcast::error::SendError<InternalMessage>> {
+        for topic in self.broker.topics() {
+            self.broker.topic(&topic).publish(msg.clone())?;
+        }
+        Ok(())
+    }
+
     pub async fn stop(&mut self) {
         tracing::info!("Initiating graceful shutdown...");
 
         // First, signal graceful stop to prevent new tasks from being processed
-        let _ = self.send(InternalMessage::GracefulStop);
+        let _ = self.broadcast(InternalMessage::GracefulStop);
 
         // Wait for all tasks (active and pending) to complete with timeout
         let start_time = tokio::time::Instant::now();
@@ -97,7 +107,7 @@ impl Dispatcher {
         tracing::debug!("All tasks completed (or timed out), stopping workers...");
 
         // Then send stop signal to terminate workers
-        let _ = self.send(InternalMessage::Stop);
+        let _ = self.broadcast(InternalMessage::Stop);
 
         tracing::debug!("Sent stop signal to workers");
 
@@ -238,7 +248,7 @@ impl Dispatcher {
         tracing::warn!("Force stopping dispatcher...");
 
         // Send stop signal immediately
-        let _ = self.send(InternalMessage::Stop);
+        let _ = self.broadcast(InternalMessage::Stop);
 
         // Abort WebSocket task handle
         if let Some(task_handle) = self.task_handle.take() {
@@ -385,7 +395,10 @@ impl Dispatcher {
                 Ok(mut inventories) => {
                     // Check existence and remove in a single atomic operation
                     if let Some(inventory) = inventories.remove(&id) {
-                        inventory.stop();
+                        let rt = tokio::runtime::Handle::current();
+                        rt.block_on(async {
+                            inventory.stop().await;
+                        });
                         tracing::debug!("Inventory stopped and removed: {}", id);
                         Ok(format!("Inventory {id} removed"))
                     } else {
@@ -521,9 +534,8 @@ mod tests {
         let task_request = crate::actor::model::TaskRequest {
             owner: Uuid::new_v4(),
             request_id: "test_request".to_string(),
-            kind: crate::actor::model::TaskKind::Build,
+            kind: crate::actor::model::TaskKind::Build("test_item".to_string()),
             respond_to: response_tx.clone(),
-            item: "test_item".to_string(),
         };
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
