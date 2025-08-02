@@ -11,6 +11,7 @@ use opentelemetry::{
     Context, global,
     trace::{Span, SpanContext, TraceContextExt, Tracer, TracerProvider},
 };
+use tokio::sync::mpsc::error::SendError;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
@@ -89,11 +90,6 @@ async fn main() {
     span.add_event("creating example inventory data", vec![]);
     let existing_inventory = fake_inventory_data(&cx);
 
-    span.set_attribute(opentelemetry::KeyValue::new(
-        "inventory.id",
-        existing_inventory.id.to_string(),
-    ));
-
     span.add_event(
         "store example data",
         vec![opentelemetry::KeyValue::new(
@@ -124,11 +120,19 @@ async fn main() {
         )],
     );
 
-    let _inventory = building_game::actor::inventory::Inventory::new(
+    let existing_inventory = building_game::actor::inventory::Inventory::new(
         existing_inventory.id.clone(),
         broker.clone().topic("inventory").sender.clone(),
         &store_tx.clone(),
         Some(cx.clone()),
+    );
+
+    existing_inventory.resources.lock().unwrap().insert(
+        "wood".to_string(),
+        Value {
+            name: "wood".to_string(),
+            value: 100,
+        },
     );
 
     // Create a new inventory instance that will restore from persistence
@@ -141,12 +145,25 @@ async fn main() {
         )],
     );
 
-    let _inventory = building_game::actor::inventory::Inventory::new(
+    let _nonexistent_inventory = building_game::actor::inventory::Inventory::new(
         nonexistent_inventory_id.clone(),
         broker.clone().topic("inventory").sender.clone(),
         &store_tx.clone(),
         Some(cx.clone()),
     );
+
+    if let Err(e) = persist_inventory(&existing_inventory, &store_tx).await {
+        tracing::error!("Failed to persist inventory: {}", existing_inventory.id.to_string());
+        span.add_event("failed to persist inventory", vec![
+            opentelemetry::KeyValue::new("error", e.to_string()),
+            opentelemetry::KeyValue::new("inventory.id", existing_inventory.id.to_string()),
+        ]);
+    } else {
+        tracing::info!("inventory persisted successfully: {}", existing_inventory.id.to_string());
+        span.add_event("inventory persisted", vec![
+            opentelemetry::KeyValue::new("inventory.id", existing_inventory.id.to_string()),
+        ]);
+    }
 
     // Give enough time for the inventory to restore its data
     tracing::info!("Waiting for inventory restoration to complete...");
@@ -275,4 +292,17 @@ fn fake_inventory_data(cx: &SpanContext) -> building_game::actor::inventory::Inv
     span.end();
 
     return inv;
+}
+
+async fn persist_inventory(inventory: &building_game::actor::inventory::Inventory, tx: &tokio::sync::mpsc::Sender<building_game::persistence::worker::Op>) -> Result<(), SendError<building_game::persistence::worker::Op>> {
+    let key = format!("inventory:{}", inventory.id);
+    let value = inventory.serialize().unwrap();
+
+    tx.send(building_game::persistence::worker::Op {
+        op_type: building_game::persistence::worker::OpType::Set(key, value),
+        reply: None,
+        span_context: None,
+    }).await?;
+
+    Ok(())
 }

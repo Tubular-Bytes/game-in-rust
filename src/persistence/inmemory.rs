@@ -100,7 +100,7 @@ impl Persister for MemoryDatabase {
         let tracer = global::tracer("persistence.inmemory");
         let parent_context = cx.unwrap_or_else(opentelemetry::trace::SpanContext::empty_context);
         let context = Context::current().with_remote_span_context(parent_context.clone());
-        let mut span = tracer.start_with_context("persistence.inmemory.set", &context);
+        let mut span = tracer.start_with_context("persistence.inmemory.get", &context);
 
         let db = self.db.read().map_err(|_| {
             span.add_event(
